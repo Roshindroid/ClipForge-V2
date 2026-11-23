@@ -98,11 +98,40 @@ function readJson<T>(filePath: string, fallback: T): T {
   }
 }
 
+function sleepSync(ms: number): void {
+  const shared = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(shared, 0, 0, ms);
+}
+
 function writeJsonAtomic<T>(filePath: string, data: T): void {
   ensureWorkspace();
   const tmpPath = `${filePath}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmpPath, filePath);
+  try {
+    // Windows: OneDrive/AV/indexer holds transient locks that make rename() fail with EPERM.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        fs.renameSync(tmpPath, filePath);
+        return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        const transient = code === 'EPERM' || code === 'EACCES' || code === 'EBUSY' || code === 'ENOTEMPTY';
+        if (!transient || attempt >= 7) throw err;
+        sleepSync(40 * (attempt + 1));
+      }
+    }
+  } catch {
+    // Fallback: overwrite the destination in place, then drop the temp file.
+    try {
+      fs.copyFileSync(tmpPath, filePath);
+    } finally {
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        // best-effort temp cleanup
+      }
+    }
+  }
 }
 
 function removeEmptySourceSubdir(filePath: string): void {
