@@ -11,9 +11,18 @@ import firebaseConfig from '../../firebase-applet-config.json';
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 const auth = getAuth(app);
 
-const provider = new GoogleAuthProvider();
-provider.addScope('https://www.googleapis.com/auth/youtube.upload');
-provider.addScope('https://www.googleapis.com/auth/youtube.readonly');
+export const OAUTH_PROJECT_ID = firebaseConfig.projectId;
+
+function createYouTubeProvider() {
+  const p = new GoogleAuthProvider();
+  p.addScope('https://www.googleapis.com/auth/youtube.upload');
+  p.addScope('https://www.googleapis.com/auth/youtube.readonly');
+  // Force both Google account picker (for secondary email IDs) and consent/Brand Account channel picker
+  p.setCustomParameters({
+    prompt: 'select_account consent',
+  });
+  return p;
+}
 
 let isSigningIn = false;
 // Strictly in-memory token cache (never persisted to localStorage or sessionStorage)
@@ -26,6 +35,7 @@ export interface YouTubeChannelProfile {
   thumbnailUrl?: string;
   subscriberCount?: string;
   videoCount?: string;
+  accountEmail?: string;
 }
 
 export function initYouTubeAuth(
@@ -42,19 +52,52 @@ export function initYouTubeAuth(
   });
 }
 
+function formatSignInError(err: unknown): Error {
+  const code = (err as { code?: string })?.code || '';
+  const message = err instanceof Error ? err.message : 'Google sign-in failed';
+  const lower = message.toLowerCase();
+
+  if (code === 'auth/popup-blocked') {
+    return new Error(
+      'Sign-in popup was blocked by your browser. Allow popups for this site and click Sign in with Google again.'
+    );
+  }
+  if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+    return new Error(
+      `Google sign-in was cancelled or blocked. If Google showed "Access blocked (403)" for your secondary email, add that secondary email under Google Cloud Console → Google Auth Platform → Audience → Test users for project "${OAUTH_PROJECT_ID}".`
+    );
+  }
+  if (lower.includes('access_denied') || lower.includes('403')) {
+    return new Error(
+      `Google blocked access for that secondary email because the OAuth app is in Testing mode. Add your secondary email ID under Google Cloud Console → Google Auth Platform → Audience → Test users (Project: ${OAUTH_PROJECT_ID}), then try again.`
+    );
+  }
+  if (code === 'auth/unauthorized-domain') {
+    return new Error(
+      `This domain (${window.location.hostname}) is not authorized in Firebase Authentication. Refresh or authorize this host in Firebase Console.`
+    );
+  }
+  return new Error(message);
+}
+
 export async function signInWithYouTube(): Promise<{
   user: User;
   accessToken: string;
 }> {
   try {
     isSigningIn = true;
+    const provider = createYouTubeProvider();
     const result = await signInWithPopup(auth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
-      throw new Error('Google sign-in completed, but no YouTube access token was returned.');
+      throw new Error(
+        'Google sign-in completed, but no YouTube access token was returned. Re-try and grant YouTube permissions.'
+      );
     }
     cachedAccessToken = credential.accessToken;
     return { user: result.user, accessToken: cachedAccessToken };
+  } catch (err) {
+    throw formatSignInError(err);
   } finally {
     isSigningIn = false;
   }
@@ -64,20 +107,29 @@ export function getCachedYouTubeToken(): string | null {
   return cachedAccessToken;
 }
 
+export function getSignedInEmail(): string | null {
+  return auth.currentUser?.email || null;
+}
+
 export async function signOutYouTube(): Promise<void> {
   await auth.signOut();
   cachedAccessToken = null;
 }
 
 export async function fetchMyYouTubeChannel(
-  accessToken: string
-): Promise<YouTubeChannelProfile | null> {
+  accessToken: string,
+  accountEmail?: string | null
+): Promise<YouTubeChannelProfile> {
   const res = await fetch(
     'https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&mine=true',
     {
       headers: { Authorization: `Bearer ${accessToken}` },
     }
   );
+  if (res.status === 401) {
+    cachedAccessToken = null;
+    throw new Error('Your Google session expired. Please sign in again to connect your channel.');
+  }
   if (!res.ok) {
     const errText = await res.text();
     throw new Error(`YouTube channel lookup failed (${res.status}): ${errText.slice(0, 180)}`);
@@ -94,7 +146,12 @@ export async function fetchMyYouTubeChannel(
     }>;
   };
   const ch = data.items?.[0];
-  if (!ch) return null;
+  const resolvedEmail = accountEmail ?? auth.currentUser?.email ?? undefined;
+  if (!ch) {
+    throw new Error(
+      `Signed in${resolvedEmail ? ` as ${resolvedEmail}` : ''}, but no YouTube channel was found on that account. Click "Switch Account / Channel" and select your secondary email ID or Brand Account.`
+    );
+  }
   return {
     id: ch.id,
     title: ch.snippet?.title || 'Connected Channel',
@@ -102,6 +159,7 @@ export async function fetchMyYouTubeChannel(
     thumbnailUrl: ch.snippet?.thumbnails?.medium?.url || ch.snippet?.thumbnails?.default?.url,
     subscriberCount: ch.statistics?.subscriberCount,
     videoCount: ch.statistics?.videoCount,
+    accountEmail: resolvedEmail,
   };
 }
 
@@ -151,6 +209,11 @@ export async function uploadShortToYouTube(params: {
       body: JSON.stringify(metadata),
     }
   );
+
+  if (initRes.status === 401) {
+    cachedAccessToken = null;
+    throw new Error('YouTube upload session expired. Please reconnect your channel and try again.');
+  }
 
   if (!initRes.ok) {
     const errBody = await initRes.text();

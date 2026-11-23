@@ -135,7 +135,26 @@ async function startServer() {
 
     const providerRaw = req.body?.provider;
     const provider =
-      providerRaw === 'anthropic' || providerRaw === 'openai' ? providerRaw : 'auto';
+      providerRaw === 'both' ||
+      providerRaw === 'anthropic' ||
+      providerRaw === 'openai' ||
+      providerRaw === 'auto'
+        ? providerRaw
+        : 'both';
+
+    const existingHashtags = Array.isArray(req.body?.existingHashtags)
+      ? req.body.existingHashtags.map((h: unknown) => String(h).trim().slice(0, 40)).filter(Boolean)
+      : clip?.hashtags;
+
+    const existingTags = Array.isArray(req.body?.existingTags)
+      ? req.body.existingTags.map((t: unknown) => String(t).trim().slice(0, 50)).filter(Boolean)
+      : clip?.tags;
+
+    const existingAlternativeTitles = Array.isArray(req.body?.existingAlternativeTitles)
+      ? req.body.existingAlternativeTitles
+          .map((t: unknown) => String(t).trim().slice(0, 100))
+          .filter(Boolean)
+      : clip?.alternativeTitles;
 
     try {
       const suggestion = await generateYouTubeMetadataWithAi({
@@ -144,14 +163,25 @@ async function startServer() {
         projectTitle: project?.title,
         durationSec:
           typeof req.body?.durationSec === 'number' ? req.body.durationSec : clip?.durationSec,
+        existingTitle:
+          typeof req.body?.existingTitle === 'string' && req.body.existingTitle.trim()
+            ? req.body.existingTitle.trim().slice(0, 120)
+            : clip?.title,
         existingHook:
           typeof req.body?.existingHook === 'string'
             ? req.body.existingHook.slice(0, 140)
             : clip?.hookTagline,
         existingDescription:
           typeof req.body?.existingDescription === 'string'
-            ? req.body.existingDescription.slice(0, 500)
+            ? req.body.existingDescription.slice(0, 600)
             : clip?.description,
+        existingHashtags,
+        existingTags,
+        existingAlternativeTitles,
+        modifyInstruction:
+          typeof req.body?.modifyInstruction === 'string'
+            ? req.body.modifyInstruction.slice(0, 240)
+            : undefined,
       });
       res.json({ suggestion });
     } catch (err) {

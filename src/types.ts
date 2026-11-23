@@ -153,6 +153,8 @@ export interface AiMetadataSuggestion {
   hashtags: string[];
   tags: string[];
   providerUsed: string;
+  providersUsed?: string[];
+  warnings?: string[];
 }
 
 export interface AiProviderStatus {
