@@ -38,6 +38,7 @@ import {
   FRAMES_DIR,
   RENDERS_DIR,
   SOURCES_DIR,
+  clearProjectSources,
   deleteClip,
   deleteProject,
   getClip,
@@ -614,6 +615,35 @@ async function startServer() {
     });
 
     res.json({ project: updated });
+  });
+
+  app.post('/api/projects/:id/clear-sources', (req, res) => {
+    const project = getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    const segmentIds = Array.isArray(req.body?.segmentIds)
+      ? (req.body.segmentIds as string[])
+      : undefined;
+
+    const busy = project.segments.some(
+      (s) =>
+        (!segmentIds || segmentIds.length === 0 || segmentIds.includes(s.id)) &&
+        (s.downloadStatus === 'downloading' ||
+          s.renderStatus === 'queued' ||
+          s.renderStatus === 'rendering')
+    );
+    if (busy) {
+      return res.status(409).json({
+        error: 'Cannot delete downloaded segment files while a download or render is in progress.',
+      });
+    }
+
+    const result = clearProjectSources(req.params.id, segmentIds);
+    res.json({
+      project: result.project,
+      freedBytes: result.freedBytes,
+      storage: getStorageStatus(),
+    });
   });
 
   // --- Frame Extraction & True FFmpeg 9:16 Composite Previews ---

@@ -120,6 +120,8 @@ export function FacecamLayoutStudio({
   const [savingNotice, setSavingNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [submittingRender, setSubmittingRender] = useState(false);
+  const [clearSourcesOpen, setClearSourcesOpen] = useState(false);
+  const [clearingSources, setClearingSources] = useState(false);
 
   // Sync local editor when project ID or activeSegment ID changes
   const lastSyncRef = useRef<string>('');
@@ -725,6 +727,36 @@ export function FacecamLayoutStudio({
     [project.segments]
   );
 
+  const totalSourceBytes = useMemo(
+    () => project.segments.reduce((acc, s) => acc + (s.sourceSizeBytes || 0), 0),
+    [project.segments]
+  );
+
+  const handleClearDownloadedSources = async () => {
+    setClearingSources(true);
+    setActionError(null);
+    try {
+      const targetIds =
+        selectedSegmentIds.length > 0 && selectedSegmentIds.length < readySegments.length
+          ? selectedSegmentIds
+          : undefined;
+      const res = await fetch(`/api/projects/${project.id}/clear-sources`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ segmentIds: targetIds }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not clear downloaded segment files.');
+      if (data.project) onProjectUpdated(data.project);
+      setClearSourcesOpen(false);
+      flashNotice(`Freed ${formatBytes(data.freedBytes)}`);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to clear source segments');
+    } finally {
+      setClearingSources(false);
+    }
+  };
+
   const anyRendering = project.segments.some(
     (s) => s.renderStatus === 'queued' || s.renderStatus === 'rendering'
   );
@@ -822,6 +854,17 @@ export function FacecamLayoutStudio({
             >
               Apply Layout to All
             </button>
+            {readySegments.length > 0 && totalSourceBytes > 0 && (
+              <button
+                type="button"
+                disabled={anyRendering}
+                onClick={() => setClearSourcesOpen(true)}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-[#0E1016] hover:bg-rose-950/60 border border-[#232834] hover:border-rose-700 rounded-md text-amber-300 hover:text-rose-200 cursor-pointer disabled:opacity-40"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Free Source Storage ({formatBytes(totalSourceBytes)})
+              </button>
+            )}
           </div>
         </div>
 
@@ -1492,6 +1535,42 @@ export function FacecamLayoutStudio({
               autoPlay
               className="w-full aspect-video bg-black rounded-lg border border-[#232834]"
             />
+          </div>
+        </div>
+      )}
+
+      {/* Clear Downloaded Source Segments Confirmation Modal */}
+      {clearSourcesOpen && (
+        <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+          <div className="bg-[#13161D] border border-[#2E3545] rounded-xl max-w-md w-full p-6 space-y-4">
+            <h3 className="font-display text-base font-semibold text-[#F4F5F7]">
+              Delete Downloaded Segment Files?
+            </h3>
+            <p className="text-sm text-[#94A3B8]">
+              {selectedSegmentIds.length > 0 && selectedSegmentIds.length < readySegments.length
+                ? `This will delete ${selectedSegmentIds.length} selected downloaded segment MP4 file(s) from disk to save storage.`
+                : `This will delete all ${readySegments.length} downloaded segment MP4 file(s) (${formatBytes(totalSourceBytes)}) from disk to save storage.`}
+            </p>
+            <p className="text-xs text-emerald-300 bg-emerald-950/35 border border-emerald-700/50 rounded-lg p-3">
+              Your finished 9:16 Shorts in My Clips remain completely safe, and you can re-download any segment later if needed.
+            </p>
+            <div className="flex items-center justify-end gap-3 pt-1">
+              <button
+                type="button"
+                onClick={() => setClearSourcesOpen(false)}
+                className="px-4 py-2 text-xs font-medium bg-[#1C212C] border border-[#32394A] rounded-lg text-[#F4F5F7] cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={clearingSources}
+                onClick={handleClearDownloadedSources}
+                className="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-500 text-white rounded-lg cursor-pointer disabled:opacity-50"
+              >
+                {clearingSources ? 'Deleting...' : 'Delete Source Segments'}
+              </button>
+            </div>
           </div>
         </div>
       )}

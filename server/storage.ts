@@ -418,6 +418,54 @@ export function deleteProject(
   return { deleted: true, deletedClipCount };
 }
 
+/**
+ * Deletes downloaded segment source files from workspace/sources/<projectId>/ to free disk space
+ * while keeping the project record and all finished rendered clips in workspace/renders/ intact.
+ */
+export function clearProjectSources(
+  projectId: string,
+  segmentIds?: string[]
+): { project?: ClipProject; freedBytes: number } {
+  const project = getProject(projectId);
+  if (!project) return { freedBytes: 0 };
+
+  const targetAll = !segmentIds || segmentIds.length === 0;
+  const targetSet = new Set(segmentIds || []);
+  let freedBytes = 0;
+
+  const nextSegments = project.segments.map((seg) => {
+    if (!targetAll && !targetSet.has(seg.id)) return seg;
+    if (seg.downloadStatus === 'downloading' || seg.renderStatus === 'rendering' || seg.renderStatus === 'queued') {
+      return seg;
+    }
+
+    if (seg.sourceFileName) {
+      try {
+        const segPath = resolveSafeSourcePath(seg.sourceFileName);
+        if (fs.existsSync(segPath)) {
+          freedBytes += fs.statSync(segPath).size;
+          fs.unlinkSync(segPath);
+          removeEmptySourceSubdir(segPath);
+        }
+      } catch {
+        // ignore invalid path
+      }
+    }
+
+    return {
+      ...seg,
+      downloadStatus: 'pending' as const,
+      downloadProgress: 0,
+      downloadError: undefined,
+      sourceFileName: undefined,
+      sourceSizeBytes: 0,
+    };
+  });
+
+  const saved = saveProject({ ...project, segments: nextSegments });
+  return { project: saved, freedBytes };
+}
+
 export function listClips(): RenderedClip[] {
   const raw = readJson<RenderedClip[]>(CLIPS_FILE, []);
   const { clips, changed } = syncRenderedClipsWithDisk(raw);
