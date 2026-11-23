@@ -1,210 +1,221 @@
-import { GoogleGenAI } from '@google/genai';
-import { checkOllama, getOllamaHost } from './capabilities.ts';
+import type { AiMetadataSuggestion, AiProviderStatus } from '../src/types.ts';
 
-export interface CandidateClipInput {
-  startSec: number;
-  endSec: number;
-  audioPeakDb: number;
-  audioSpikeScore: number;
-  transcriptSnippet: string;
+export function getAiProviderStatus(): AiProviderStatus {
+  return {
+    anthropic: Boolean(process.env.ANTHROPIC_API_KEY?.trim()),
+    openai: Boolean(process.env.OPENAI_API_KEY?.trim()),
+  };
 }
 
-export interface ScoredClipOutput {
-  llmScore: number;
-  title: string;
-  hookTagline: string;
-  description: string;
-  hashtags: string[];
-  reason: string;
-  scoredBy: string;
+export interface GenerateYouTubeMetadataInput {
+  provider?: 'auto' | 'anthropic' | 'openai';
+  clipTitle: string;
+  projectTitle?: string;
+  durationSec?: number;
+  existingHook?: string;
+  existingDescription?: string;
 }
 
-async function callOpenAICompatible(params: {
-  endpointUrl: string;
-  apiKey: string;
-  model: string;
-  prompt: string;
-  extraHeaders?: Record<string, string>;
-}): Promise<string> {
+function parseMetadataJson(raw: string, providerLabel: string): AiMetadataSuggestion {
+  const cleaned = raw
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```$/i, '')
+    .trim();
+
+  const parsed = JSON.parse(cleaned) as {
+    title?: string;
+    alternativeTitles?: unknown[];
+    hookTagline?: string;
+    description?: string;
+    hashtags?: unknown[];
+    tags?: unknown[];
+  };
+
+  const title = String(parsed.title || 'Unbelievable Stream Highlight #Shorts').trim().slice(0, 100);
+  const alternativeTitles = Array.isArray(parsed.alternativeTitles)
+    ? parsed.alternativeTitles.map((t) => String(t).trim().slice(0, 100)).filter(Boolean).slice(0, 4)
+    : [];
+  const hookTagline = String(parsed.hookTagline || 'Wait until the final second').trim().slice(0, 120);
+  const description = String(parsed.description || '').trim().slice(0, 1200);
+  const hashtags = Array.isArray(parsed.hashtags)
+    ? parsed.hashtags
+        .map((h) => {
+          const s = String(h).trim().replace(/\s+/g, '');
+          if (!s) return '';
+          return s.startsWith('#') ? s : `#${s}`;
+        })
+        .filter(Boolean)
+        .slice(0, 10)
+    : ['#shorts', '#highlights'];
+  const tags = Array.isArray(parsed.tags)
+    ? parsed.tags.map((t) => String(t).trim().replace(/^#/, '')).filter(Boolean).slice(0, 15)
+    : ['shorts', 'stream clips', 'highlights'];
+
+  return {
+    title,
+    alternativeTitles,
+    hookTagline,
+    description,
+    hashtags,
+    tags,
+    providerUsed: providerLabel,
+  };
+}
+
+async function callAnthropicMetadata(prompt: string, apiKey: string): Promise<AiMetadataSuggestion> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 14000);
+  const timer = setTimeout(() => controller.abort(), 18000);
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...params.extraHeaders,
-    };
-    if (params.apiKey) {
-      headers.Authorization = `Bearer ${params.apiKey}`;
+    const models = ['claude-sonnet-4-20250514', 'claude-3-5-haiku-latest'];
+    let lastError = 'Anthropic request failed';
+
+    for (const model of models) {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 700,
+          temperature: 0.6,
+          system:
+            'You are a YouTube Shorts metadata specialist. Respond strictly with valid JSON matching the requested schema and no markdown fences.',
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.text();
+        lastError = `Anthropic API returned HTTP ${res.status}`;
+        if (res.status === 404 && model !== models[models.length - 1]) {
+          continue;
+        }
+        if (res.status === 429 || errBody.toLowerCase().includes('credit') || errBody.toLowerCase().includes('quota')) {
+          throw new Error('Anthropic API rate limit or quota reached. Continue editing metadata manually.');
+        }
+        throw new Error(`${lastError}. Continue editing metadata manually.`);
+      }
+
+      const payload = (await res.json()) as {
+        content?: Array<{ type?: string; text?: string }>;
+      };
+      const text = payload.content?.find((c) => c.type === 'text')?.text || '';
+      if (!text) throw new Error('Anthropic returned empty content.');
+      return parseMetadataJson(text, `Anthropic (${model})`);
     }
 
-    const res = await fetch(params.endpointUrl, {
-      method: 'POST',
-      headers,
-      signal: controller.signal,
-      body: JSON.stringify({
-        model: params.model,
-        temperature: 0.35,
-        response_format: { type: 'json_object' },
-        messages: [
-          {
-            role: 'system',
-            content: 'Respond strictly with valid JSON matching the requested schema.',
-          },
-          { role: 'user', content: params.prompt },
-        ],
-      }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`HTTP ${res.status}: ${text.slice(0, 160)}`);
-    }
-
-    const payload = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const content = payload.choices?.[0]?.message?.content;
-    if (!content) throw new Error('Empty completion content');
-    return content;
+    throw new Error(lastError);
   } finally {
     clearTimeout(timer);
   }
 }
 
-export async function scoreMomentsWithRouter(
-  projectTitle: string,
-  candidates: CandidateClipInput[]
-): Promise<ScoredClipOutput[] | null> {
-  if (candidates.length === 0) return null;
+async function callOpenAIMetadata(prompt: string, apiKey: string): Promise<AiMetadataSuggestion> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 18000);
+  try {
+    const model = 'gpt-4o-mini';
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.6,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a YouTube Shorts metadata specialist. Respond strictly with valid JSON matching the requested schema.',
+          },
+          { role: 'user', content: prompt },
+        ],
+      }),
+    });
 
-  const geminiKey = process.env.GEMINI_API_KEY?.trim() || '';
-  const groqKey = process.env.GROQ_API_KEY?.trim() || '';
-  const openrouterKey = process.env.OPENROUTER_API_KEY?.trim() || '';
-  const ollamaInfo = await checkOllama().catch(() => ({ available: false, host: '', models: [] }));
+    if (!res.ok) {
+      const errBody = await res.text();
+      if (res.status === 429 || errBody.toLowerCase().includes('quota') || errBody.toLowerCase().includes('insufficient_quota')) {
+        throw new Error('OpenAI API quota or rate limit reached. Continue editing metadata manually.');
+      }
+      throw new Error(`OpenAI API returned HTTP ${res.status}. Continue editing metadata manually.`);
+    }
+
+    const payload = (await res.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const text = payload.choices?.[0]?.message?.content || '';
+    if (!text) throw new Error('OpenAI returned empty content.');
+    return parseMetadataJson(text, `OpenAI (${model})`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Generates YouTube Shorts titles, alternative titles, hook, description, hashtags, and searchable tags
+ * strictly on the backend using configured Anthropic or OpenAI keys.
+ */
+export async function generateYouTubeMetadataWithAi(
+  input: GenerateYouTubeMetadataInput
+): Promise<AiMetadataSuggestion> {
+  const anthropicKey = process.env.ANTHROPIC_API_KEY?.trim() || '';
+  const openaiKey = process.env.OPENAI_API_KEY?.trim() || '';
+
+  const requested = input.provider || 'auto';
+
+  if (requested === 'anthropic' && !anthropicKey) {
+    throw new Error('ANTHROPIC_API_KEY is not configured in the server environment.');
+  }
+  if (requested === 'openai' && !openaiKey) {
+    throw new Error('OPENAI_API_KEY is not configured in the server environment.');
+  }
+  if (!anthropicKey && !openaiKey) {
+    throw new Error(
+      'No AI provider keys configured (ANTHROPIC_API_KEY or OPENAI_API_KEY). Enter metadata manually.'
+    );
+  }
 
   const prompt = [
-    'You are picking the best short-form vertical moments for YouTube Shorts.',
-    `Source video title: "${projectTitle}".`,
-    `Evaluate these ${candidates.length} candidate segments (with transcript & audio energy) and return JSON strictly matching: {"clips":[{"llmScore":0.0-1.0,"title":"short punchy title","hookTagline":"1-line hook tagline","description":"2-sentence YouTube Shorts description","hashtags":["#shorts","#highlights"],"reason":"brief reason"}]}`,
-    `Candidates: ${JSON.stringify(candidates)}`,
-  ].join('\n');
+    'Generate high-retention YouTube Shorts metadata for the following video clip.',
+    `Clip title / notes: "${input.clipTitle}"`,
+    input.projectTitle ? `Source video: "${input.projectTitle}"` : '',
+    input.durationSec ? `Clip duration: ${input.durationSec} seconds` : '',
+    input.existingHook ? `Existing hook context: "${input.existingHook}"` : '',
+    input.existingDescription ? `Existing notes: "${input.existingDescription}"` : '',
+    'Return valid JSON strictly matching this schema:',
+    '{"title":"punchy primary YouTube Shorts title under 90 chars","alternativeTitles":["alt title 1","alt title 2","alt title 3"],"hookTagline":"1 short hook sentence","description":"engaging 2-3 sentence YouTube Shorts description","hashtags":["#shorts","#gaming","#clips","#highlights","#viral"],"tags":["comma-searchable tag 1","tag 2","tag 3","tag 4","tag 5","tag 6"]}',
+  ]
+    .filter(Boolean)
+    .join('\n');
 
-  const attempts: Array<{
-    label: string;
-    run: () => Promise<string>;
-  }> = [];
-
-  if (geminiKey) {
-    attempts.push({
-      label: 'Gemini (gemini-2.5-flash)',
-      run: async () => {
-        const ai = new GoogleGenAI({ apiKey: geminiKey });
-        const response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-          config: { responseMimeType: 'application/json' },
-        });
-        return response.text || '';
-      },
-    });
+  const runners: Array<() => Promise<AiMetadataSuggestion>> = [];
+  if (requested === 'anthropic') {
+    runners.push(() => callAnthropicMetadata(prompt, anthropicKey));
+  } else if (requested === 'openai') {
+    runners.push(() => callOpenAIMetadata(prompt, openaiKey));
+  } else {
+    if (anthropicKey) runners.push(() => callAnthropicMetadata(prompt, anthropicKey));
+    if (openaiKey) runners.push(() => callOpenAIMetadata(prompt, openaiKey));
   }
 
-  if (groqKey) {
-    attempts.push({
-      label: 'Groq (llama-3.3-70b-versatile)',
-      run: () =>
-        callOpenAICompatible({
-          endpointUrl: 'https://api.groq.com/openai/v1/chat/completions',
-          apiKey: groqKey,
-          model: 'llama-3.3-70b-versatile',
-          prompt,
-        }),
-    });
-  }
-
-  if (openrouterKey) {
-    attempts.push({
-      label: 'OpenRouter (llama-3.3-70b)',
-      run: () =>
-        callOpenAICompatible({
-          endpointUrl: 'https://openrouter.ai/api/v1/chat/completions',
-          apiKey: openrouterKey,
-          model: 'meta-llama/llama-3.3-70b-instruct:free',
-          prompt,
-          extraHeaders: { 'X-Title': 'ClipForge' },
-        }),
-    });
-  }
-
-  if (ollamaInfo.available && ollamaInfo.models.length > 0) {
-    const model = process.env.OLLAMA_MODEL?.trim() || ollamaInfo.models[0];
-    attempts.push({
-      label: `Ollama (${model})`,
-      run: async () => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 14000);
-        try {
-          const res = await fetch(`${getOllamaHost()}/api/generate`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal: controller.signal,
-            body: JSON.stringify({
-              model,
-              prompt,
-              stream: false,
-              format: 'json',
-            }),
-          });
-          if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
-          const payload = (await res.json()) as { response?: string };
-          return payload.response || '';
-        } finally {
-          clearTimeout(timer);
-        }
-      },
-    });
-  }
-
-  for (const attempt of attempts) {
+  let lastError: Error | null = null;
+  for (const run of runners) {
     try {
-      const rawText = await attempt.run();
-      const cleaned = rawText
-        .replace(/^```json\s*/i, '')
-        .replace(/```$/i, '')
-        .trim();
-      const parsed = JSON.parse(cleaned) as {
-        clips?: Array<{
-          llmScore?: number;
-          title?: string;
-          hookTagline?: string;
-          description?: string;
-          hashtags?: string[];
-          reason?: string;
-        }>;
-      };
-
-      if (!Array.isArray(parsed.clips) || parsed.clips.length !== candidates.length) {
-        continue;
-      }
-
-      return parsed.clips.map((c, idx) => ({
-        llmScore: Math.min(1, Math.max(0.2, Number(c.llmScore || 0.75))),
-        title: String(c.title || `Peak Moment #${idx + 1}`).slice(0, 90),
-        hookTagline: String(c.hookTagline || 'Wait until the final second').slice(0, 110),
-        description: String(
-          c.description ||
-            `Clipped from ${projectTitle}. Watch the key audio spike and reaction moment.`
-        ).slice(0, 400),
-        hashtags: Array.isArray(c.hashtags)
-          ? c.hashtags.slice(0, 6).map((h) => (h.startsWith('#') ? h : `#${h}`))
-          : ['#shorts', '#clips', '#highlights'],
-        reason: String(c.reason || `${attempt.label} viral highlight match`).slice(0, 140),
-        scoredBy: attempt.label,
-      }));
-    } catch {
-      // Try next configured AI provider silently
+      return await run();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error('AI metadata request failed');
     }
   }
 
-  return null;
+  throw lastError || new Error('AI metadata generation failed. Continue editing manually.');
 }

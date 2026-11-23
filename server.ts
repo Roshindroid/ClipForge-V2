@@ -3,61 +3,51 @@ import fs from 'node:fs';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import express from 'express';
-import multer from 'multer';
 import { createServer as createViteServer } from 'vite';
-import type {
-  BrandingConfig,
-  FacecamBox,
-  LayoutId,
-  TemplateId,
-  VideoProject,
-  ViralMoment,
+import {
+  LAYOUT_OPTIONS,
+  type BrandingConfig,
+  type ClipProject,
+  type FacecamBox,
+  type LayoutId,
+  type ProjectSegment,
+  type TemplateId,
 } from './src/types.ts';
+import { parseMultilineTimestamps } from './src/lib/timestampParser.ts';
 import {
-  analyzeVideoProject,
-  computeFinalRankScore,
-  findViralMoments,
-} from './server/analyzer.ts';
-import {
-  downloadMomentSegment1080p,
+  extractSegmentFrameAtFraction,
   generateSampleStreamVideo,
   inspectFromUrl,
+  probeMediaFile,
 } from './server/ingest.ts';
 import {
-  canAutoPruneProject,
-  completeJob,
-  createJob,
-  enqueueRenderTask,
-  failJob,
-  getJob,
-  updateJob,
-} from './server/jobs.ts';
-import { ensureRemotePreviewSegment, renderVerticalClip } from './server/renderer.ts';
+  generateYouTubeMetadataWithAi,
+  getAiProviderStatus,
+} from './server/llmRouter.ts';
 import {
-  createBatchProcessJob,
-  getBatchJob,
-  listBatchJobs,
-  streamBatchZipArchive,
-} from './server/batchJobs.ts';
-import { parseMultilineTimestamps } from './src/lib/timestampParser.ts';
+  startSegmentDownloads,
+  startSegmentRenders,
+} from './server/projectRunner.ts';
+import {
+  clampFacecamBox,
+  layoutUsesFacecam,
+  renderLayoutPreviewFrame,
+  renderPreviewVideo,
+} from './server/rendererV2.ts';
 import {
   FRAMES_DIR,
   RENDERS_DIR,
   SOURCES_DIR,
-  cleanupProjectSource,
   deleteClip,
   deleteProject,
-  ensureWorkspace,
   getClip,
   getProject,
   getStorageStatus,
   listClips,
   listProjects,
-  loadAppSettings,
-  pruneAllDownloadedSources,
   resolveSafeChildPath,
   resolveSafeSourcePath,
-  saveAppSettings,
+  restoreWorkspaceOnBoot,
   saveClip,
   saveProject,
 } from './server/storage.ts';
@@ -69,16 +59,7 @@ import {
 } from './server/ytdlp.ts';
 
 dotenv.config();
-ensureWorkspace();
-
-// Ensure ffmpeg is in PATH (Windows: add BtbN FFmpeg build path)
-if (process.platform === 'win32') {
-  const ffmpegPath = 'C:\\Users\\roshi\\AppData\\Local\\Temp\\ffmpeg\\ffmpeg-master-latest-win64-gpl-shared\\bin';
-  const currentPath = process.env.PATH || '';
-  if (!currentPath.includes(ffmpegPath)) {
-    process.env.PATH = ffmpegPath + ';' + currentPath;
-  }
-}
+restoreWorkspaceOnBoot();
 
 ensureYtDlp().catch(() => {
   // Auto-bootstraps on demand when a URL is inspected
@@ -87,32 +68,40 @@ ensureYtDlp().catch(() => {
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
 
-const ALLOWED_VIDEO_EXTS = new Set(['.mp4', '.mov', '.webm', '.mkv']);
+const VALID_LAYOUT_IDS = new Set<LayoutId>(LAYOUT_OPTIONS.map((l) => l.id));
+const VALID_TEMPLATE_IDS = new Set<TemplateId>(['none', 'x-post', 'tiktok-hook', 'breaking-news']);
 
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => {
-      ensureWorkspace();
-      cb(null, SOURCES_DIR);
-    },
-    filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname || '').toLowerCase();
-      const safeExt = ALLOWED_VIDEO_EXTS.has(ext) ? ext : '.mp4';
-      cb(null, `upload_${crypto.randomBytes(6).toString('hex')}${safeExt}`);
-    },
-  }),
-  limits: {
-    fileSize: 100 * 1024 * 1024 * 1024,
-  },
-  fileFilter: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || '').toLowerCase();
-    if (ALLOWED_VIDEO_EXTS.has(ext) || file.mimetype.startsWith('video/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only MP4, MOV, WebM, and MKV video files are supported.'));
-    }
-  },
-});
+function normalizeBranding(raw: unknown, fallback?: BrandingConfig): BrandingConfig {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  return {
+    creditText:
+      typeof r.creditText === 'string'
+        ? r.creditText.slice(0, 40)
+        : (fallback?.creditText ?? '@clipforge'),
+    backgroundHex:
+      typeof r.backgroundHex === 'string' && /^#[0-9a-fA-F]{6}$/.test(r.backgroundHex.trim())
+        ? r.backgroundHex.trim()
+        : (fallback?.backgroundHex ?? '#0B0D11'),
+    watermarkText:
+      typeof r.watermarkText === 'string'
+        ? r.watermarkText.slice(0, 40)
+        : (fallback?.watermarkText ?? ''),
+  };
+}
+
+function validateLayoutId(raw: unknown, fallback: LayoutId = 'split-top-cam'): LayoutId {
+  if (typeof raw === 'string' && VALID_LAYOUT_IDS.has(raw as LayoutId)) {
+    return raw as LayoutId;
+  }
+  return fallback;
+}
+
+function validateTemplateId(raw: unknown, fallback: TemplateId = 'none'): TemplateId {
+  if (typeof raw === 'string' && VALID_TEMPLATE_IDS.has(raw as TemplateId)) {
+    return raw as TemplateId;
+  }
+  return fallback;
+}
 
 async function startServer() {
   const app = express();
@@ -125,6 +114,55 @@ async function startServer() {
   app.get('/favicon.ico', (_req, res) => {
     res.status(204).end();
   });
+
+  // --- AI Provider Status & Optional YouTube Metadata Assistant (Backend-Only) ---
+
+  app.get('/api/ai/providers', (_req, res) => {
+    res.json({ providers: getAiProviderStatus() });
+  });
+
+  app.post('/api/youtube/generate-metadata', async (req, res) => {
+    const clipId = typeof req.body?.clipId === 'string' ? req.body.clipId : '';
+    const clip = clipId ? getClip(clipId) : undefined;
+    const project = clip ? getProject(clip.projectId) : undefined;
+
+    const clipTitle =
+      typeof req.body?.clipTitle === 'string' && req.body.clipTitle.trim()
+        ? req.body.clipTitle.trim().slice(0, 120)
+        : clip?.title || 'Stream Highlight';
+
+    const providerRaw = req.body?.provider;
+    const provider =
+      providerRaw === 'anthropic' || providerRaw === 'openai' ? providerRaw : 'auto';
+
+    try {
+      const suggestion = await generateYouTubeMetadataWithAi({
+        provider,
+        clipTitle,
+        projectTitle: project?.title,
+        durationSec:
+          typeof req.body?.durationSec === 'number' ? req.body.durationSec : clip?.durationSec,
+        existingHook:
+          typeof req.body?.existingHook === 'string'
+            ? req.body.existingHook.slice(0, 140)
+            : clip?.hookTagline,
+        existingDescription:
+          typeof req.body?.existingDescription === 'string'
+            ? req.body.existingDescription.slice(0, 500)
+            : clip?.description,
+      });
+      res.json({ suggestion });
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Could not generate AI metadata. Continue editing manually.',
+      });
+    }
+  });
+
+  // --- yt-dlp Cookie Management ---
 
   app.get('/api/ytdlp/cookies/status', (_req, res) => {
     res.json(getCookiesStatus());
@@ -145,17 +183,7 @@ async function startServer() {
     res.json(getCookiesStatus());
   });
 
-  app.get('/api/jobs/:id', (req, res) => {
-    const job = getJob(req.params.id);
-    if (!job) return res.status(404).json({ error: 'Job not found or expired' });
-    res.json({ job });
-  });
-
-  app.get('/api/projects', (_req, res) => {
-    res.json({ projects: listProjects() });
-  });
-
-  // --- ClipForge V2 API Routes ---
+  // --- Stage 1: URL Inspection & Timestamp Validation ---
 
   app.post('/api/v2/inspect-url', async (req, res) => {
     const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
@@ -166,19 +194,18 @@ async function startServer() {
     try {
       const inspected = await inspectFromUrl(
         rawUrl,
-        typeof req.body?.title === 'string' ? req.body.title : undefined,
-        undefined,
-        { skipAutoTranscript: true }
+        typeof req.body?.title === 'string' ? req.body.title : undefined
       );
 
       res.json({
         title: inspected.title,
         platform: inspected.platform,
-        durationSec: inspected.preProbed?.durationSec || 0,
-        width: inspected.preProbed?.width || 1920,
-        height: inspected.preProbed?.height || 1080,
-        fps: inspected.preProbed?.fps || 30,
-        chapters: inspected.chapters || [],
+        durationSec: inspected.preProbed.durationSec,
+        width: inspected.preProbed.width,
+        height: inspected.preProbed.height,
+        fps: inspected.preProbed.fps,
+        hasAudio: inspected.preProbed.hasAudio,
+        thumbnailUrl: inspected.thumbnailUrl,
       });
     } catch (err) {
       res.status(400).json({
@@ -194,750 +221,596 @@ async function startServer() {
     res.json(result);
   });
 
-  app.post('/api/v2/jobs', (req, res) => {
-    const {
-      videoUrl,
-      videoTitle,
-      videoDurationSec,
-      segments,
-      preferredLayout,
-      templateId,
-      resolution,
-      frameRate,
-      branding,
-    } = req.body || {};
+  // --- Persistent Projects & Segment Management ---
 
-    if (!videoUrl || typeof videoUrl !== 'string') {
-      return res.status(400).json({ error: 'Valid video URL is required.' });
+  app.get('/api/projects', (_req, res) => {
+    res.json({ projects: listProjects() });
+  });
+
+  app.get('/api/projects/:id', (req, res) => {
+    const project = getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    res.json({ project });
+  });
+
+  app.post('/api/projects', (req, res) => {
+    const body = req.body || {};
+    const sourceUrl = typeof body.sourceUrl === 'string' ? body.sourceUrl.trim() : '';
+    if (!sourceUrl) {
+      return res.status(400).json({ error: 'Source video URL is required.' });
     }
 
-    if (!Array.isArray(segments) || segments.length === 0) {
-      return res.status(400).json({ error: 'At least one valid segment is required.' });
+    const rawSegments = Array.isArray(body.segments) ? body.segments : [];
+    if (rawSegments.length === 0) {
+      return res.status(400).json({ error: 'At least one valid timestamp segment is required.' });
     }
 
-    try {
-      const job = createBatchProcessJob({
-        videoUrl: videoUrl.trim(),
-        videoTitle:
-          typeof videoTitle === 'string' && videoTitle.trim() ? videoTitle.trim() : 'Video Project',
-        videoDurationSec: Number(videoDurationSec) || 0,
-        segments: segments.map((s: { order?: number; startSeconds?: number; endSeconds?: number; durationSeconds?: number; label?: string }, idx: number) => ({
-          order: typeof s.order === 'number' ? s.order : idx + 1,
-          startSeconds: Number(s.startSeconds || 0),
-          endSeconds: Number(s.endSeconds || 0),
-          durationSeconds: Number(
-            s.durationSeconds || Math.max(2, (s.endSeconds || 0) - (s.startSeconds || 0))
-          ),
-          label: typeof s.label === 'string' ? s.label : undefined,
-        })),
-        preferredLayout: preferredLayout || 'split-top-cam',
-        templateId: templateId || 'none',
-        resolution: resolution === '720x1280' ? '720x1280' : '1080x1920',
-        frameRate: frameRate === '60' ? '60' : frameRate === '30' ? '30' : 'original',
-        branding,
-      });
+    const durationSec = Number(body.durationSec || 0);
+    const parsedSegments: ProjectSegment[] = [];
 
-      res.status(202).json({ jobId: job.id, job });
-    } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Could not create batch job.',
-      });
-    }
-  });
-
-  app.get('/api/v2/jobs', (_req, res) => {
-    res.json({ jobs: listBatchJobs() });
-  });
-
-  app.get('/api/v2/jobs/:id', (req, res) => {
-    const job = getBatchJob(req.params.id);
-    if (!job) return res.status(404).json({ error: 'Batch job not found or expired.' });
-    res.json({ job });
-  });
-
-  app.get('/api/v2/jobs/:id/segments', (req, res) => {
-    const job = getBatchJob(req.params.id);
-    if (!job) return res.status(404).json({ error: 'Batch job not found.' });
-    res.json({ segments: job.segments });
-  });
-
-  app.get('/api/v2/jobs/:id/download/:segmentId', (req, res) => {
-    const job = getBatchJob(req.params.id);
-    if (!job) return res.status(404).json({ error: 'Batch job not found.' });
-
-    const segment = job.segments.find(
-      (s) => s.id === req.params.segmentId || String(s.order) === req.params.segmentId
-    );
-    if (!segment || !segment.outputPath || !fs.existsSync(segment.outputPath)) {
-      return res.status(404).json({ error: 'Segment video file not found or not rendered yet.' });
-    }
-
-    const downloadFileName =
-      segment.outputFileName || `clip_${String(segment.order).padStart(3, '0')}.mp4`;
-    res.download(segment.outputPath, downloadFileName);
-  });
-
-  app.get('/api/v2/jobs/:id/download-all', (req, res) => {
-    const job = getBatchJob(req.params.id);
-    if (!job) return res.status(404).json({ error: 'Batch job not found.' });
-    streamBatchZipArchive(job, res);
-  });
-
-  app.post('/api/ingest/upload', upload.single('video'), (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ error: 'Please choose a video file to upload.' });
-    }
-
-    const uploadedFile = req.file;
-    const rawTitle = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
-    const transcriptText =
-      typeof req.body?.transcriptText === 'string' ? req.body.transcriptText : undefined;
-    const title =
-      rawTitle ||
-      path.basename(uploadedFile.originalname, path.extname(uploadedFile.originalname)) ||
-      'Uploaded Video';
-
-    const job = createJob('ingest-upload', 'Analyzing uploaded video...', title.slice(0, 80));
-
-    (async () => {
-      try {
-        const project = await analyzeVideoProject({
-          fileName: uploadedFile.filename,
-          title: title.slice(0, 120),
-          sourceType: 'local',
-          sourceMode: 'local',
-          transcriptText,
-          onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
+    for (let i = 0; i < rawSegments.length; i++) {
+      const s = rawSegments[i] as Record<string, unknown>;
+      const startSeconds = Number(s.startSeconds);
+      const endSeconds = Number(s.endSeconds);
+      if (
+        !Number.isFinite(startSeconds) ||
+        !Number.isFinite(endSeconds) ||
+        startSeconds < 0 ||
+        endSeconds <= startSeconds ||
+        endSeconds - startSeconds < 2
+      ) {
+        return res.status(400).json({
+          error: `Segment #${i + 1} has invalid start/end timestamps (minimum 2s duration).`,
         });
-        saveProject(project);
-        completeJob(job.id, { project });
-      } catch (err) {
-        if (uploadedFile.path && fs.existsSync(uploadedFile.path)) {
-          try {
-            fs.unlinkSync(uploadedFile.path);
-          } catch {
-            // ignore
-          }
-        }
-        failJob(job.id, err instanceof Error ? err.message : 'Upload analysis failed');
       }
-    })();
+      if (durationSec > 0 && endSeconds > durationSec) {
+        return res.status(400).json({
+          error: `Segment #${i + 1} end time (${endSeconds}s) exceeds source video duration (${durationSec}s).`,
+        });
+      }
+      const segDuration = Math.round((endSeconds - startSeconds) * 10) / 10;
+      const label =
+        typeof s.label === 'string' && s.label.trim()
+          ? s.label.trim().slice(0, 90)
+          : `Clip #${i + 1}`;
 
-    res.status(202).json({ jobId: job.id, job });
-  });
-
-  /**
-   * Step 1: Inspect URL remotely (0 video download). Pulls metadata, heatmaps,
-   * chapters, and auto-captions, then detects the top viral moments.
-   */
-  app.post('/api/ingest/url', (req, res) => {
-    const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
-    const titleOverride = typeof req.body?.title === 'string' ? req.body.title.trim() : undefined;
-    const manualTranscript =
-      typeof req.body?.transcriptText === 'string' && req.body.transcriptText.trim()
-        ? req.body.transcriptText.trim()
-        : undefined;
-    const downloadFolder =
-      typeof req.body?.downloadFolder === 'string' ? req.body.downloadFolder.trim() : 'segments';
-
-    if (!rawUrl) {
-      return res.status(400).json({ error: 'Video URL is required.' });
+      parsedSegments.push({
+        id: `seg_${crypto.randomBytes(5).toString('hex')}`,
+        order: i + 1,
+        startSeconds,
+        endSeconds,
+        durationSeconds: segDuration,
+        title: label,
+        hookTagline: label,
+        downloadStatus: 'pending',
+        downloadProgress: 0,
+        facecamBox: null,
+        hasCustomFacecam: false,
+        layoutId: 'split-top-cam',
+        hasCustomLayout: false,
+        renderStatus: 'idle',
+        renderProgress: 0,
+      });
     }
 
-    const job = createJob(
-      'ingest-url',
-      'Inspecting link for best moments (no full download)...',
-      rawUrl.slice(0, 80)
-    );
+    const now = new Date().toISOString();
+    const project: ClipProject = {
+      id: `proj_${crypto.randomBytes(6).toString('hex')}`,
+      title:
+        typeof body.title === 'string' && body.title.trim()
+          ? body.title.trim().slice(0, 120)
+          : 'ClipForge Project',
+      sourceType:
+        body.sourceType === 'youtube' ||
+        body.sourceType === 'twitch' ||
+        body.sourceType === 'kick' ||
+        body.sourceType === 'local'
+          ? body.sourceType
+          : 'direct',
+      sourceUrl,
+      thumbnailUrl: typeof body.thumbnailUrl === 'string' ? body.thumbnailUrl : undefined,
+      durationSec,
+      width: Number(body.width || 1920),
+      height: Number(body.height || 1080),
+      fps: Number(body.fps || 30),
+      hasAudio: body.hasAudio !== false,
+      sharedFacecamBox: null,
+      sharedLayoutId: validateLayoutId(body.sharedLayoutId, 'split-top-cam'),
+      templateId: validateTemplateId(body.templateId, 'none'),
+      resolution: body.resolution === '720x1280' ? '720x1280' : '1080x1920',
+      frameRate: body.frameRate === '60' ? '60' : body.frameRate === '30' ? '30' : 'original',
+      branding: normalizeBranding(body.branding),
+      segments: parsedSegments,
+      createdAt: now,
+      updatedAt: now,
+    };
 
-    (async () => {
-      try {
-        const inspected = await inspectFromUrl(
-          rawUrl,
-          titleOverride,
-          (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
-          {
-            downloadFolder,
-            skipAutoTranscript: Boolean(manualTranscript),
-          }
-        );
-
-        const resolvedTranscript = manualTranscript || inspected.autoTranscriptText;
-        const project = await analyzeVideoProject({
-          title: inspected.title,
-          sourceType: inspected.platform,
-          sourceMode: 'segments',
-          downloadFolder: inspected.downloadFolder,
-          sourceUrl: rawUrl,
-          streamUrls: inspected.streamUrls,
-          preProbed: inspected.preProbed,
-          chapters: inspected.chapters,
-          heatmap: inspected.heatmap,
-          transcriptText: resolvedTranscript,
-          autoTranscriptFetched: Boolean(!manualTranscript && inspected.autoTranscriptText),
-          onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
-        });
-
-        saveProject(project);
-        completeJob(job.id, { project });
-      } catch (err) {
-        failJob(job.id, err instanceof Error ? err.message : 'Link inspection failed');
-      }
-    })();
-
-    res.status(202).json({ jobId: job.id, job });
+    const saved = saveProject(project);
+    res.status(201).json({ project: saved });
   });
 
-  app.post('/api/ingest/sample', async (_req, res) => {
+  app.post('/api/projects/sample', async (_req, res) => {
     try {
       const sample = await generateSampleStreamVideo();
-      const sampleTranscript = [
-        '00:00:00,000 --> 00:00:05,500',
-        'Wait look at the corner right now, no way we hold this angle.',
-        '',
-        '00:00:08,200 --> 00:00:12,500',
-        'OH MY GOD WHAT A CLUTCH! Did you actually see that insane flick?!',
-        '',
-        '00:00:13,500 --> 00:00:17,800',
-        'Bro chat is going crazy, clip that right now before it disappears!',
-      ].join('\n');
+      const samplePath = resolveSafeChildPath(SOURCES_DIR, sample.fileName);
+      const probed = await probeMediaFile(samplePath);
+      const projectId = `proj_${crypto.randomBytes(6).toString('hex')}`;
+      const projDir = resolveSafeSourcePath(projectId);
+      if (!fs.existsSync(projDir)) {
+        fs.mkdirSync(projDir, { recursive: true });
+      }
 
-      const project = await analyzeVideoProject({
-        fileName: sample.fileName,
+      const defs = [
+        { order: 1, startSeconds: 1, endSeconds: 7, title: 'Opening Setup Clip' },
+        { order: 2, startSeconds: 8, endSeconds: 16, title: 'Clutch Highlight Moment' },
+      ];
+
+      const segments: ProjectSegment[] = [];
+      for (const d of defs) {
+        const segId = `seg_${crypto.randomBytes(5).toString('hex')}`;
+        const relFile = `${projectId}/segment_${String(d.order).padStart(3, '0')}_${segId}.mp4`;
+        const destPath = resolveSafeSourcePath(relFile);
+        const { execFile } = await import('node:child_process');
+        const { promisify } = await import('node:util');
+        await promisify(execFile)('ffmpeg', [
+          '-y',
+          '-ss',
+          String(d.startSeconds),
+          '-t',
+          String(d.endSeconds - d.startSeconds),
+          '-i',
+          samplePath,
+          '-c',
+          'copy',
+          destPath,
+        ]);
+        const frameUrl = await extractSegmentFrameAtFraction({
+          projectId,
+          segmentId: segId,
+          segmentFilePath: destPath,
+          durationSec: d.endSeconds - d.startSeconds,
+          fraction: 0.5,
+        });
+        segments.push({
+          id: segId,
+          order: d.order,
+          startSeconds: d.startSeconds,
+          endSeconds: d.endSeconds,
+          durationSeconds: d.endSeconds - d.startSeconds,
+          title: d.title,
+          hookTagline: d.title,
+          downloadStatus: 'ready',
+          downloadProgress: 100,
+          sourceFileName: relFile,
+          sourceSizeBytes: fs.statSync(destPath).size,
+          frameUrl,
+          width: probed.width,
+          height: probed.height,
+          fps: probed.fps,
+          hasAudio: probed.hasAudio,
+          facecamBox: null,
+          hasCustomFacecam: false,
+          layoutId: 'split-top-cam',
+          hasCustomLayout: false,
+          renderStatus: 'idle',
+          renderProgress: 0,
+        });
+      }
+
+      // Clean up temporary full sample file so only project segments remain
+      if (fs.existsSync(samplePath)) {
+        fs.unlinkSync(samplePath);
+      }
+
+      const now = new Date().toISOString();
+      const project: ClipProject = {
+        id: projectId,
         title: sample.title,
-        sourceType: sample.platform,
-        sourceMode: 'local',
-        transcriptText: sampleTranscript,
-      });
-
-      saveProject(project);
-      res.status(201).json({ project });
-    } catch (err) {
-      res
-        .status(500)
-        .json({ error: err instanceof Error ? err.message : 'Sample stream generation failed' });
-    }
-  });
-
-  /**
-   * Step 2a: Select/deselect moments or refine their startSec/endSec/title before downloading in 1080p.
-   */
-  app.patch('/api/projects/:id/moments/:momentId', (req, res) => {
-    const project = getProject(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Project not found' });
-
-    const target = project.moments.find((m) => m.id === req.params.momentId);
-    if (!target) return res.status(404).json({ error: 'Moment not found' });
-
-    const nextStart =
-      typeof req.body?.startSec === 'number'
-        ? Math.max(0, Math.min(project.durationSec - 2, Number(req.body.startSec)))
-        : target.startSec;
-    const nextEnd =
-      typeof req.body?.endSec === 'number'
-        ? Math.min(project.durationSec, Math.max(nextStart + 2, Number(req.body.endSec)))
-        : Math.max(nextStart + 2, target.endSec);
-
-    const boundsChanged =
-      Math.abs(nextStart - target.startSec) > 0.25 || Math.abs(nextEnd - target.endSec) > 0.25;
-
-    const updatedMoments = project.moments.map((m) => {
-      if (m.id !== target.id) return m;
-      return {
-        ...m,
-        startSec: Math.round(nextStart * 10) / 10,
-        endSec: Math.round(nextEnd * 10) / 10,
-        durationSec: Math.round((nextEnd - nextStart) * 10) / 10,
-        title:
-          typeof req.body?.title === 'string' && req.body.title.trim()
-            ? req.body.title.trim().slice(0, 90)
-            : m.title,
-        selected: typeof req.body?.selected === 'boolean' ? req.body.selected : m.selected,
-        segmentStatus:
-          boundsChanged && project.sourceMode === 'segments' ? ('pending' as const) : m.segmentStatus,
-        segmentFileName: boundsChanged ? undefined : m.segmentFileName,
-        segmentSizeBytes: boundsChanged ? 0 : m.segmentSizeBytes,
+        sourceType: 'local',
+        sourceUrl: 'sample://local-demo',
+        thumbnailUrl: segments[0]?.frameUrl,
+        durationSec: probed.durationSec,
+        width: probed.width,
+        height: probed.height,
+        fps: probed.fps,
+        hasAudio: probed.hasAudio,
+        sharedFacecamBox: null,
+        sharedLayoutId: 'split-top-cam',
+        templateId: 'none',
+        resolution: '1080x1920',
+        frameRate: 'original',
+        branding: { creditText: '@clipforge', backgroundHex: '#0B0D11', watermarkText: '' },
+        segments,
+        createdAt: now,
+        updatedAt: now,
       };
-    });
 
-    const updated = saveProject({ ...project, moments: updatedMoments });
-    res.json({ project: updated });
-  });
-
-  /**
-   * Step 2b: Download ONLY selected moments in 1080p MP4 into workspace/sources/<folder>/.
-   */
-  app.post('/api/projects/:id/download-segments', (req, res) => {
-    const project = getProject(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Project not found' });
-    if (project.sourceMode !== 'segments' || !project.sourceUrl) {
-      return res.status(400).json({ error: 'Project is already backed by a local video file.' });
-    }
-
-    const requestedIds = Array.isArray(req.body?.momentIds)
-      ? (req.body.momentIds as string[])
-      : null;
-
-    const targetMoments = project.moments.filter((m) => {
-      if (requestedIds && requestedIds.length > 0) {
-        return requestedIds.includes(m.id);
-      }
-      return m.selected && m.segmentStatus !== 'ready';
-    });
-
-    if (targetMoments.length === 0) {
-      return res.json({ project, alreadyReady: true });
-    }
-
-    const job = createJob(
-      'download-segments',
-      `Downloading ${targetMoments.length} moment(s) in 1080p...`,
-      project.title,
-      { projectId: project.id }
-    );
-
-    (async () => {
-      try {
-        let currentProject = getProject(project.id) || project;
-
-        for (let i = 0; i < targetMoments.length; i++) {
-          const target = targetMoments[i];
-          updateJob(job.id, {
-            progress: Math.max(5, Math.round((i / targetMoments.length) * 100)),
-            stage: `Downloading clip ${i + 1}/${targetMoments.length} in 1080p...`,
-            detail: target.title,
-          });
-
-          try {
-            const seg = await downloadMomentSegment1080p({
-              project: currentProject,
-              moment: target,
-              onProgress: (dlPct, dlDetail) => {
-                const overall = Math.round(((i + dlPct / 100) / targetMoments.length) * 100);
-                updateJob(job.id, {
-                  progress: overall,
-                  stage: `Downloading clip ${i + 1}/${targetMoments.length} in 1080p...`,
-                  detail: dlDetail,
-                });
-              },
-            });
-
-            currentProject = saveProject({
-              ...currentProject,
-              moments: currentProject.moments.map((m) =>
-                m.id === target.id
-                  ? {
-                      ...m,
-                      segmentStatus: 'ready',
-                      segmentFileName: seg.segmentFileName,
-                      segmentSizeBytes: seg.segmentSizeBytes,
-                      segmentError: undefined,
-                    }
-                  : m
-              ),
-            });
-          } catch (segErr) {
-            const msg = segErr instanceof Error ? segErr.message : 'Segment download failed';
-            currentProject = saveProject({
-              ...currentProject,
-              moments: currentProject.moments.map((m) =>
-                m.id === target.id
-                  ? { ...m, segmentStatus: 'error', segmentError: msg }
-                  : m
-              ),
-            });
-            throw segErr;
-          }
-        }
-
-        completeJob(job.id, { project: currentProject });
-      } catch (err) {
-        failJob(job.id, err instanceof Error ? err.message : '1080p segment download failed');
-      }
-    })();
-
-    res.status(202).json({ jobId: job.id, job });
-  });
-
-  app.post('/api/projects/:id/reanalyze', async (req, res) => {
-    try {
-      const project = getProject(req.params.id);
-      if (!project) return res.status(404).json({ error: 'Project not found' });
-
-      const transcriptText =
-        typeof req.body?.transcriptText === 'string'
-          ? req.body.transcriptText
-          : project.transcriptText;
-
-      const moments = await findViralMoments(
-        project.title,
-        project.durationSec,
-        project.audioEnergySeries,
-        project.sourceMode,
-        transcriptText
-      );
-
-      const updated = saveProject({
-        ...project,
-        transcriptText,
-        moments,
-      });
-      res.json({ project: updated });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Re-analysis failed' });
-    }
-  });
-
-  app.get('/api/projects/:id/moments/:momentId/preview', async (req, res) => {
-    try {
-      const project = getProject(req.params.id);
-      if (!project) return res.status(404).json({ error: 'Project not found' });
-
-      const moment = project.moments.find((m) => m.id === req.params.momentId);
-      if (!moment) return res.status(404).json({ error: 'Moment not found' });
-
-      // Serve downloaded 1080p segment directly if ready on disk
-      if (moment.segmentFileName && moment.segmentStatus === 'ready') {
-        const segPath = resolveSafeSourcePath(moment.segmentFileName);
-        if (fs.existsSync(segPath)) {
-          res.sendFile(segPath);
-          return;
-        }
-      }
-
-      const previewDur = Math.min(55, Math.max(15, moment.durationSec + 8));
-      const previewStart = Math.max(0, moment.startSec - 2);
-      const previewPath = await ensureRemotePreviewSegment(project, previewStart, previewDur);
-      res.sendFile(previewPath);
+      const saved = saveProject(project);
+      res.status(201).json({ project: saved });
     } catch (err) {
       res.status(500).json({
-        error: err instanceof Error ? err.message : 'Could not prepare segment preview',
+        error: err instanceof Error ? err.message : 'Failed to create sample project.',
       });
     }
   });
 
-  app.get('/api/projects/:id/preview-window', async (req, res) => {
-    try {
-      const project = getProject(req.params.id);
-      if (!project) return res.status(404).json({ error: 'Project not found' });
-
-      const startSec = Math.max(0, Number(req.query.start ?? 0));
-      const durSec = Math.min(60, Math.max(10, Number(req.query.dur ?? 45)));
-      const previewPath = await ensureRemotePreviewSegment(project, startSec, durSec);
-      res.sendFile(previewPath);
-    } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Could not prepare timestamp preview',
-      });
-    }
-  });
-
-  app.post('/api/projects/:id/moments', (req, res) => {
+  app.patch('/api/projects/:id', (req, res) => {
     const project = getProject(req.params.id);
     if (!project) return res.status(404).json({ error: 'Project not found' });
 
-    const startSec = Math.max(0, Number(req.body?.startSec ?? 0));
-    const rawEnd = Number(req.body?.endSec ?? startSec + 15);
-    const endSec = Math.min(project.durationSec, Math.max(startSec + 2, rawEnd));
-    const durationSec = Math.round((endSec - startSec) * 10) / 10;
-    const title =
-      typeof req.body?.title === 'string' && req.body.title.trim()
-        ? req.body.title.trim().slice(0, 90)
-        : `Custom Clip (${startSec.toFixed(1)}s – ${endSec.toFixed(1)}s)`;
-
-    const slice = project.audioEnergySeries.filter((p) => p.sec >= startSec && p.sec <= endSec);
-    let peakDb = -18;
-    let avgNorm = 0.65;
-    if (slice.length > 0) {
-      peakDb = slice.reduce((acc, p) => (p.db > acc ? p.db : acc), slice[0].db);
-      avgNorm = slice.reduce((a, b) => a + b.normalized, 0) / slice.length;
-    } else if (project.audioEnergySeries.length > 0) {
-      const nearest = project.audioEnergySeries.reduce((best, p) =>
-        Math.abs(p.sec - startSec) < Math.abs(best.sec - startSec) ? p : best
-      );
-      peakDb = nearest.db;
-      avgNorm = nearest.normalized;
-    }
-
-    const audioSpikeScore = Math.round(Math.min(0.99, Math.max(0.4, avgNorm + 0.15)) * 100) / 100;
-    const transcriptScore = 0.72;
-    const llmScore = 0.78;
-    const finalRankScore = computeFinalRankScore({
-      audioSpikeScore,
-      transcriptScore,
-      llmScore,
-      durationSec,
-    });
-
-    const newMoment: ViralMoment = {
-      id: `mom_${crypto.randomBytes(4).toString('hex')}`,
-      startSec: Math.round(startSec * 10) / 10,
-      endSec: Math.round(endSec * 10) / 10,
-      durationSec,
-      title,
-      hookTagline: title,
-      description: `Manual clip from ${project.title}.`,
-      hashtags: ['#shorts', '#highlights'],
-      audioPeakDb: peakDb,
-      audioSpikeScore,
-      transcriptScore,
-      llmScore,
-      finalRankScore,
-      reason: 'Custom timestamp selection',
-      transcriptSnippet: '',
-      selected: true,
-      segmentStatus: project.sourceMode === 'local' ? 'ready' : 'pending',
-      segmentSizeBytes: 0,
-    };
+    const body = req.body || {};
+    const nextSharedFacecam =
+      body.sharedFacecamBox === null
+        ? null
+        : body.sharedFacecamBox && typeof body.sharedFacecamBox === 'object'
+          ? clampFacecamBox(body.sharedFacecamBox as FacecamBox)
+          : project.sharedFacecamBox;
 
     const updated = saveProject({
       ...project,
-      moments: [newMoment, ...project.moments],
+      title:
+        typeof body.title === 'string' && body.title.trim()
+          ? body.title.trim().slice(0, 120)
+          : project.title,
+      sharedLayoutId: body.sharedLayoutId
+        ? validateLayoutId(body.sharedLayoutId, project.sharedLayoutId)
+        : project.sharedLayoutId,
+      sharedFacecamBox: nextSharedFacecam,
+      templateId: body.templateId
+        ? validateTemplateId(body.templateId, project.templateId)
+        : project.templateId,
+      resolution:
+        body.resolution === '720x1280'
+          ? '720x1280'
+          : body.resolution === '1080x1920'
+            ? '1080x1920'
+            : project.resolution,
+      frameRate:
+        body.frameRate === '60'
+          ? '60'
+          : body.frameRate === '30'
+            ? '30'
+            : body.frameRate === 'original'
+              ? 'original'
+              : project.frameRate,
+      branding: body.branding ? normalizeBranding(body.branding, project.branding) : project.branding,
     });
-    res.status(201).json({ project: updated, moment: newMoment });
+
+    res.json({ project: updated });
   });
 
-  app.post('/api/projects/:id/facecam', (req, res) => {
+  app.delete('/api/projects/:id', (req, res) => {
+    const deleteClips = req.query.deleteClips === 'true';
+    const result = deleteProject(req.params.id, { deleteClips });
+    if (!result.deleted) return res.status(404).json({ error: 'Project not found' });
+    res.json({ ok: true, deletedClipCount: result.deletedClipCount });
+  });
+
+  // --- Phase C: Separated Segment Download (Never Triggers Facecam Detection or Rendering) ---
+
+  app.post('/api/projects/:id/download-segments', (req, res) => {
+    try {
+      const segmentIds = Array.isArray(req.body?.segmentIds)
+        ? (req.body.segmentIds as string[])
+        : undefined;
+      const result = startSegmentDownloads(req.params.id, segmentIds);
+      const project = getProject(req.params.id);
+      res.status(202).json({ ...result, project });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Could not start segment downloads.',
+      });
+    }
+  });
+
+  // --- Stage 2: Manual Facecam Positioning, Per-Segment Overrides & Bulk Apply ---
+
+  app.patch('/api/projects/:id/segments/:segmentId', (req, res) => {
     const project = getProject(req.params.id);
     if (!project) return res.status(404).json({ error: 'Project not found' });
 
-    const box = req.body?.facecamBox as Partial<FacecamBox> | undefined;
-    if (!box || typeof box.x !== 'number' || typeof box.y !== 'number') {
+    const seg = project.segments.find((s) => s.id === req.params.segmentId);
+    if (!seg) return res.status(404).json({ error: 'Segment not found' });
+
+    const body = req.body || {};
+    const nextFacecam =
+      body.facecamBox === null
+        ? null
+        : body.facecamBox && typeof body.facecamBox === 'object'
+          ? clampFacecamBox(body.facecamBox as FacecamBox)
+          : seg.facecamBox;
+
+    const updatedSegments = project.segments.map((s) => {
+      if (s.id !== seg.id) return s;
+      return {
+        ...s,
+        title:
+          typeof body.title === 'string' && body.title.trim()
+            ? body.title.trim().slice(0, 90)
+            : s.title,
+        hookTagline:
+          typeof body.hookTagline === 'string'
+            ? body.hookTagline.slice(0, 120)
+            : s.hookTagline,
+        facecamBox: nextFacecam,
+        hasCustomFacecam:
+          typeof body.hasCustomFacecam === 'boolean'
+            ? body.hasCustomFacecam
+            : body.facecamBox !== undefined
+              ? true
+              : s.hasCustomFacecam,
+        layoutId: body.layoutId ? validateLayoutId(body.layoutId, s.layoutId) : s.layoutId,
+        hasCustomLayout:
+          typeof body.hasCustomLayout === 'boolean'
+            ? body.hasCustomLayout
+            : body.layoutId !== undefined
+              ? true
+              : s.hasCustomLayout,
+      };
+    });
+
+    const updated = saveProject({ ...project, segments: updatedSegments });
+    res.json({ project: updated });
+  });
+
+  app.post('/api/projects/:id/apply-facecam', (req, res) => {
+    const project = getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    const rawBox = req.body?.facecamBox;
+    const facecamBox =
+      rawBox === null
+        ? null
+        : rawBox && typeof rawBox === 'object'
+          ? clampFacecamBox(rawBox as FacecamBox)
+          : null;
+
+    if (!facecamBox && rawBox !== null) {
       return res.status(400).json({ error: 'Valid normalized facecamBox coordinates required.' });
     }
 
-    const clamped: FacecamBox = {
-      x: Math.max(0, Math.min(0.9, box.x)),
-      y: Math.max(0, Math.min(0.9, box.y)),
-      width: Math.max(0.08, Math.min(1, Number(box.width || 0.25))),
-      height: Math.max(0.08, Math.min(1, Number(box.height || 0.28))),
-      confidence: Number(box.confidence ?? 1),
-      presetLabel: String(box.presetLabel || 'Custom Region').slice(0, 48),
-    };
+    const segmentIds = Array.isArray(req.body?.segmentIds)
+      ? (req.body.segmentIds as string[])
+      : null;
+    const applyAll = !segmentIds || segmentIds.length === 0;
 
-    const updated = saveProject({ ...project, detectedFacecam: clamped });
+    const updated = saveProject({
+      ...project,
+      sharedFacecamBox: applyAll ? facecamBox : project.sharedFacecamBox,
+      segments: project.segments.map((s) => {
+        if (!applyAll && !segmentIds.includes(s.id)) return s;
+        return {
+          ...s,
+          facecamBox,
+          hasCustomFacecam: !applyAll,
+        };
+      }),
+    });
+
     res.json({ project: updated });
   });
+
+  app.post('/api/projects/:id/apply-layout', (req, res) => {
+    const project = getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    const layoutId = validateLayoutId(req.body?.layoutId, project.sharedLayoutId);
+    const segmentIds = Array.isArray(req.body?.segmentIds)
+      ? (req.body.segmentIds as string[])
+      : null;
+    const applyAll = !segmentIds || segmentIds.length === 0;
+
+    const updated = saveProject({
+      ...project,
+      sharedLayoutId: applyAll ? layoutId : project.sharedLayoutId,
+      segments: project.segments.map((s) => {
+        if (!applyAll && !segmentIds.includes(s.id)) return s;
+        return {
+          ...s,
+          layoutId,
+          hasCustomLayout: !applyAll,
+        };
+      }),
+    });
+
+    res.json({ project: updated });
+  });
+
+  // --- Frame Extraction & True FFmpeg 9:16 Composite Previews ---
+
+  app.get('/api/projects/:id/segments/:segmentId/frame', async (req, res) => {
+    try {
+      const project = getProject(req.params.id);
+      if (!project) return res.status(404).json({ error: 'Project not found' });
+      const seg = project.segments.find((s) => s.id === req.params.segmentId);
+      if (!seg || !seg.sourceFileName) {
+        return res.status(404).json({ error: 'Segment has not been downloaded yet.' });
+      }
+      const segPath = resolveSafeSourcePath(seg.sourceFileName);
+      if (!fs.existsSync(segPath)) {
+        return res.status(404).json({ error: 'Segment source file not found on disk.' });
+      }
+      const fraction = req.query.fraction !== undefined ? Number(req.query.fraction) : 0.5;
+      const frameUrl = await extractSegmentFrameAtFraction({
+        projectId: project.id,
+        segmentId: seg.id,
+        segmentFilePath: segPath,
+        durationSec: seg.durationSeconds,
+        fraction: Number.isFinite(fraction) ? fraction : 0.5,
+      });
+
+      if (seg.frameUrl !== frameUrl && Math.abs(fraction - 0.5) < 0.01) {
+        saveProject({
+          ...project,
+          segments: project.segments.map((s) => (s.id === seg.id ? { ...s, frameUrl } : s)),
+        });
+      }
+
+      res.json({ frameUrl });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Could not extract segment frame.',
+      });
+    }
+  });
+
+  app.post('/api/projects/:id/segments/:segmentId/preview-frame', async (req, res) => {
+    try {
+      const project = getProject(req.params.id);
+      if (!project) return res.status(404).json({ error: 'Project not found' });
+      const seg = project.segments.find((s) => s.id === req.params.segmentId);
+      if (!seg || !seg.sourceFileName) {
+        return res.status(404).json({ error: 'Segment has not been downloaded yet.' });
+      }
+      const segPath = resolveSafeSourcePath(seg.sourceFileName);
+      if (!fs.existsSync(segPath)) {
+        return res.status(404).json({ error: 'Segment source file missing on disk.' });
+      }
+
+      const fraction =
+        typeof req.body?.fraction === 'number' && Number.isFinite(req.body.fraction)
+          ? req.body.fraction
+          : 0.5;
+      const frameUrl = await extractSegmentFrameAtFraction({
+        projectId: project.id,
+        segmentId: seg.id,
+        segmentFilePath: segPath,
+        durationSec: seg.durationSeconds,
+        fraction,
+      });
+      const frameFileName = frameUrl.replace('/api/frames/', '');
+      const inputImagePath = resolveSafeChildPath(FRAMES_DIR, frameFileName);
+
+      const layoutId = validateLayoutId(
+        req.body?.layoutId,
+        seg.hasCustomLayout ? seg.layoutId : project.sharedLayoutId
+      );
+      const templateId = validateTemplateId(req.body?.templateId, project.templateId);
+      const branding = normalizeBranding(req.body?.branding, project.branding);
+      const rawBox =
+        req.body?.facecamBox !== undefined
+          ? req.body.facecamBox
+          : seg.hasCustomFacecam
+            ? seg.facecamBox
+            : (seg.facecamBox ?? project.sharedFacecamBox);
+      const facecamBox =
+        rawBox && typeof rawBox === 'object' ? clampFacecamBox(rawBox as FacecamBox) : null;
+
+      if (layoutUsesFacecam(layoutId) && !facecamBox) {
+        return res.status(400).json({
+          error: 'Draw a facecam box on Panel 1 to preview facecam-based layouts.',
+        });
+      }
+
+      const hookTagline =
+        typeof req.body?.hookTagline === 'string'
+          ? req.body.hookTagline
+          : seg.hookTagline || seg.title;
+
+      const jpgBuffer = await renderLayoutPreviewFrame({
+        inputImagePath,
+        layoutId,
+        templateId,
+        facecamBox,
+        branding,
+        hookTagline,
+        outWidth: 540,
+        outHeight: 960,
+      });
+
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(jpgBuffer);
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Could not render 9:16 preview frame.',
+      });
+    }
+  });
+
+  app.post('/api/projects/:id/segments/:segmentId/preview-video', async (req, res) => {
+    try {
+      const project = getProject(req.params.id);
+      if (!project) return res.status(404).json({ error: 'Project not found' });
+      const seg = project.segments.find((s) => s.id === req.params.segmentId);
+      if (!seg || !seg.sourceFileName) {
+        return res.status(404).json({ error: 'Segment has not been downloaded yet.' });
+      }
+      const segPath = resolveSafeSourcePath(seg.sourceFileName);
+      if (!fs.existsSync(segPath)) {
+        return res.status(404).json({ error: 'Segment source file missing on disk.' });
+      }
+
+      const layoutId = validateLayoutId(
+        req.body?.layoutId,
+        seg.hasCustomLayout ? seg.layoutId : project.sharedLayoutId
+      );
+      const templateId = validateTemplateId(req.body?.templateId, project.templateId);
+      const branding = normalizeBranding(req.body?.branding, project.branding);
+      const rawBox =
+        req.body?.facecamBox !== undefined
+          ? req.body.facecamBox
+          : seg.hasCustomFacecam
+            ? seg.facecamBox
+            : (seg.facecamBox ?? project.sharedFacecamBox);
+      const facecamBox =
+        rawBox && typeof rawBox === 'object' ? clampFacecamBox(rawBox as FacecamBox) : null;
+
+      if (layoutUsesFacecam(layoutId) && !facecamBox) {
+        return res.status(400).json({
+          error: 'Draw and save a facecam region before generating a 9:16 video preview.',
+        });
+      }
+
+      const hookTagline =
+        typeof req.body?.hookTagline === 'string'
+          ? req.body.hookTagline
+          : seg.hookTagline || seg.title;
+
+      const previewUrl = await renderPreviewVideo({
+        projectId: project.id,
+        segmentId: seg.id,
+        inputFilePath: segPath,
+        layoutId,
+        templateId,
+        facecamBox,
+        branding,
+        hookTagline,
+      });
+
+      res.json({ previewUrl });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Could not render 9:16 video preview.',
+      });
+    }
+  });
+
+  // --- Phase E: Render Selected or All Segments ---
+
+  app.post('/api/projects/:id/render', (req, res) => {
+    try {
+      const segmentIds = Array.isArray(req.body?.segmentIds)
+        ? (req.body.segmentIds as string[])
+        : undefined;
+      const result = startSegmentRenders(req.params.id, segmentIds);
+      const project = getProject(req.params.id);
+      res.status(202).json({ ...result, project });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Could not start rendering.',
+      });
+    }
+  });
+
+  // --- Persistent Clips & Storage Status ---
 
   app.get('/api/storage/status', (_req, res) => {
     res.json(getStorageStatus());
   });
 
-  app.post('/api/storage/prune-sources', (_req, res) => {
-    const { projects, freedBytes } = pruneAllDownloadedSources();
-    res.json({
-      projects,
-      freedBytes,
-      storage: getStorageStatus(),
-    });
-  });
-
-  app.post('/api/projects/:id/cleanup-source', (req, res) => {
-    try {
-      const result = cleanupProjectSource(req.params.id);
-      if (!result.project) return res.status(404).json({ error: 'Project not found' });
-      res.json({
-        project: result.project,
-        freedBytes: result.freedBytes,
-        storage: getStorageStatus(),
-      });
-    } catch {
-      res.status(400).json({ error: 'Could not clean up source files safely.' });
-    }
-  });
-
-  app.delete('/api/projects/:id', (req, res) => {
-    const ok = deleteProject(req.params.id);
-    if (!ok) return res.status(404).json({ error: 'Project not found' });
-    res.json({ ok: true });
-  });
-
-  app.get('/api/settings', (_req, res) => {
-    res.json({ settings: loadAppSettings() });
-  });
-
-  app.post('/api/settings', (req, res) => {
-    const settings = saveAppSettings({
-      autoPruneSourceVod:
-        typeof req.body?.autoPruneSourceVod === 'boolean'
-          ? req.body.autoPruneSourceVod
-          : undefined,
-    });
-    res.json({ settings });
-  });
-
-  app.patch('/api/settings', (req, res) => {
-    const settings = saveAppSettings({
-      autoPruneSourceVod:
-        typeof req.body?.autoPruneSourceVod === 'boolean'
-          ? req.body.autoPruneSourceVod
-          : undefined,
-    });
-    res.json({ settings });
-  });
-
   app.get('/api/clips', (_req, res) => {
     res.json({ clips: listClips() });
-  });
-
-  const queueClipRenderJob = (params: {
-    project: VideoProject;
-    moment: ViralMoment;
-    layoutId: LayoutId;
-    templateId: TemplateId;
-    facecamBox: FacecamBox;
-    branding: BrandingConfig;
-    titleOverride?: string;
-    hookTaglineOverride?: string;
-    descriptionOverride?: string;
-    hashtagsOverride?: string[];
-  }) => {
-    const job = createJob('render', 'Queued for 1080p segment -> 9:16 Short...', params.moment.title, {
-      status: 'queued',
-      projectId: params.project.id,
-      momentId: params.moment.id,
-    });
-
-    enqueueRenderTask(async () => {
-      updateJob(job.id, { status: 'running', progress: 5, stage: 'Preparing clip...' });
-      try {
-        let latestProject = getProject(params.project.id) || params.project;
-        const latestMoment =
-          latestProject.moments.find((m) => m.id === params.moment.id) || params.moment;
-
-        const { clip, downloadedSegment } = await renderVerticalClip({
-          project: latestProject,
-          moment: latestMoment,
-          layoutId: params.layoutId,
-          templateId: params.templateId,
-          facecamBox: params.facecamBox,
-          branding: params.branding,
-          titleOverride: params.titleOverride,
-          hookTaglineOverride: params.hookTaglineOverride,
-          descriptionOverride: params.descriptionOverride,
-          hashtagsOverride: params.hashtagsOverride,
-          onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
-        });
-
-        saveClip(clip);
-
-        if (downloadedSegment) {
-          latestProject = saveProject({
-            ...latestProject,
-            moments: latestProject.moments.map((m) =>
-              m.id === latestMoment.id
-                ? {
-                    ...m,
-                    segmentStatus: 'ready',
-                    segmentFileName: downloadedSegment.segmentFileName,
-                    segmentSizeBytes: downloadedSegment.segmentSizeBytes,
-                  }
-                : m
-            ),
-          });
-        }
-
-        let autoPruned = false;
-        let updatedProject: VideoProject | undefined = downloadedSegment ? latestProject : undefined;
-        const settings = loadAppSettings();
-
-        if (settings.autoPruneSourceVod && canAutoPruneProject(latestProject.id, job.id)) {
-          const pruned = cleanupProjectSource(latestProject.id);
-          if (pruned.project) {
-            autoPruned = true;
-            updatedProject = pruned.project;
-          }
-        }
-
-        completeJob(job.id, { clip, project: updatedProject, autoPruned });
-      } catch (err) {
-        failJob(job.id, err instanceof Error ? err.message : 'FFmpeg render failed');
-      }
-    });
-
-    return job;
-  };
-
-  app.post('/api/clips/render', (req, res) => {
-    const projectId = String(req.body?.projectId || '');
-    const momentId = String(req.body?.momentId || '');
-    const layoutId = (req.body?.layoutId || 'split-top-cam') as LayoutId;
-    const templateId = (req.body?.templateId || 'none') as TemplateId;
-
-    const project = getProject(projectId);
-    if (!project) return res.status(404).json({ error: 'Project not found' });
-
-    const moment = project.moments.find((m) => m.id === momentId) || project.moments[0];
-    if (!moment) return res.status(404).json({ error: 'Moment not found' });
-
-    const facecamBox = (req.body?.facecamBox as FacecamBox) || project.detectedFacecam;
-    const branding: BrandingConfig = {
-      creditText: String(req.body?.branding?.creditText || '@clipforge').slice(0, 40),
-      backgroundHex: String(req.body?.branding?.backgroundHex || '#0B0D11').slice(0, 12),
-      watermarkText: String(req.body?.branding?.watermarkText || '').slice(0, 40),
-    };
-
-    const job = queueClipRenderJob({
-      project,
-      moment,
-      layoutId,
-      templateId,
-      facecamBox,
-      branding,
-      titleOverride: typeof req.body?.title === 'string' ? req.body.title : undefined,
-      hookTaglineOverride:
-        typeof req.body?.hookTagline === 'string' ? req.body.hookTagline : undefined,
-      descriptionOverride:
-        typeof req.body?.description === 'string' ? req.body.description : undefined,
-      hashtagsOverride: Array.isArray(req.body?.hashtags) ? req.body.hashtags : undefined,
-    });
-
-    res.status(202).json({ jobId: job.id, job });
-  });
-
-  app.post('/api/clips/render-batch', (req, res) => {
-    const projectId = String(req.body?.projectId || '');
-    const layoutId = (req.body?.layoutId || 'split-top-cam') as LayoutId;
-    const templateId = (req.body?.templateId || 'none') as TemplateId;
-
-    const project = getProject(projectId);
-    if (!project) return res.status(404).json({ error: 'Project not found' });
-
-    const requestedIds = Array.isArray(req.body?.momentIds)
-      ? (req.body.momentIds as string[])
-      : null;
-
-    const targetMoments =
-      requestedIds && requestedIds.length > 0
-        ? project.moments.filter((m) => requestedIds.includes(m.id))
-        : project.moments.filter((m) => m.selected);
-
-    if (targetMoments.length === 0) {
-      return res.status(400).json({ error: 'Select at least one moment to render.' });
-    }
-
-    const facecamBox = (req.body?.facecamBox as FacecamBox) || project.detectedFacecam;
-    const branding: BrandingConfig = {
-      creditText: String(req.body?.branding?.creditText || '@clipforge').slice(0, 40),
-      backgroundHex: String(req.body?.branding?.backgroundHex || '#0B0D11').slice(0, 12),
-      watermarkText: String(req.body?.branding?.watermarkText || '').slice(0, 40),
-    };
-
-    const jobs = targetMoments.map((moment) =>
-      queueClipRenderJob({
-        project,
-        moment,
-        layoutId,
-        templateId,
-        facecamBox,
-        branding,
-      })
-    );
-
-    res.status(202).json({
-      jobIds: jobs.map((j) => j.id),
-      jobs,
-    });
   });
 
   app.patch('/api/clips/:id', (req, res) => {
@@ -958,6 +831,12 @@ async function startServer() {
       hashtags: Array.isArray(req.body?.hashtags)
         ? req.body.hashtags.map((h: unknown) => String(h).slice(0, 32))
         : existing.hashtags,
+      tags: Array.isArray(req.body?.tags)
+        ? req.body.tags.map((t: unknown) => String(t).slice(0, 40))
+        : existing.tags,
+      alternativeTitles: Array.isArray(req.body?.alternativeTitles)
+        ? req.body.alternativeTitles.map((t: unknown) => String(t).slice(0, 100))
+        : existing.alternativeTitles,
       youtubeVideoId:
         typeof req.body?.youtubeVideoId === 'string'
           ? req.body.youtubeVideoId
@@ -978,7 +857,8 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // Safe static media routes (path-confined)
+  // --- Safe Path-Confined Media Routes ---
+
   app.get('/api/frames/:filename', (req, res) => {
     try {
       const target = resolveSafeChildPath(FRAMES_DIR, req.params.filename);

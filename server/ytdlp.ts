@@ -5,8 +5,19 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
-import type { HeatmapPoint, VideoChapter } from '../src/types.ts';
 import { WORKSPACE_ROOT, ensureWorkspace } from './storage.ts';
+
+export interface VideoChapter {
+  startSec: number;
+  endSec: number;
+  title: string;
+}
+
+export interface HeatmapPoint {
+  startSec: number;
+  endSec: number;
+  value: number;
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -36,6 +47,7 @@ export interface YtDlpMetadata {
   isLive: boolean;
   chapters: VideoChapter[];
   heatmap: HeatmapPoint[];
+  thumbnailUrl?: string;
   streamUrls?: ResolvedStreamUrls;
 }
 
@@ -342,6 +354,8 @@ export async function fetchMetadataWithYtDlp(
     fps?: number;
     is_live?: boolean;
     url?: string;
+    thumbnail?: string;
+    thumbnails?: Array<{ url?: string; preference?: number }>;
     requested_formats?: Array<{
       url?: string;
       vcodec?: string;
@@ -401,6 +415,10 @@ export async function fetchMetadataWithYtDlp(
     : [];
 
   const vidFmt = reqFormats.find((f) => f.width && f.height);
+  const thumbList = Array.isArray(info.thumbnails) ? info.thumbnails : [];
+  const bestThumb =
+    info.thumbnail ||
+    (thumbList.length > 0 ? thumbList[thumbList.length - 1]?.url : undefined);
 
   return {
     title: String(info.title || `${platform.toUpperCase()} Stream`).slice(0, 120),
@@ -412,6 +430,7 @@ export async function fetchMetadataWithYtDlp(
     isLive: Boolean(info.is_live),
     chapters,
     heatmap,
+    thumbnailUrl: typeof bestThumb === 'string' && bestThumb.startsWith('http') ? bestThumb : undefined,
     streamUrls,
   };
 }

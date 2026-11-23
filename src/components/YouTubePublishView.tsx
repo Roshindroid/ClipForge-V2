@@ -3,12 +3,13 @@ import {
   CalendarClock,
   CheckCircle2,
   ExternalLink,
+  Loader2,
   LogOut,
-  RefreshCw,
+  Sparkles,
   UploadCloud,
   Youtube,
 } from 'lucide-react';
-import type { RenderedClip } from '../types';
+import type { AiProviderStatus, RenderedClip } from '../types';
 import {
   fetchMyYouTubeChannel,
   getCachedYouTubeToken,
@@ -41,12 +42,29 @@ export function YouTubePublishView({
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
+  // Editable metadata fields
   const [title, setTitle] = useState(activeClip?.title || '');
+  const [alternativeTitles, setAlternativeTitles] = useState<string[]>(
+    activeClip?.alternativeTitles || []
+  );
   const [tagline, setTagline] = useState(activeClip?.hookTagline || '');
   const [description, setDescription] = useState(activeClip?.description || '');
   const [hashtagsText, setHashtagsText] = useState(
-    activeClip?.hashtags?.join(' ') || '#shorts #streamclips #highlights'
+    activeClip?.hashtags?.join(' ') || '#shorts #highlights'
   );
+  const [tagsText, setTagsText] = useState(
+    activeClip?.tags?.join(', ') || 'shorts, highlights, stream clips'
+  );
+
+  // Optional AI Metadata Assistant
+  const [aiProviders, setAiProviders] = useState<AiProviderStatus>({
+    anthropic: false,
+    openai: false,
+  });
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiNotice, setAiNotice] = useState<string | null>(null);
+  const [aiError, setAiError] = useState<string | null>(null);
+
   const [privacyStatus, setPrivacyStatus] = useState<'public' | 'unlisted' | 'private'>('private');
   const [scheduleEnabled, setScheduleEnabled] = useState(false);
   const [scheduleDateTime, setScheduleDateTime] = useState('');
@@ -55,6 +73,15 @@ export function YouTubePublishView({
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadedVideoId, setUploadedVideoId] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch('/api/ai/providers')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d?.providers) setAiProviders(d.providers);
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     const unsub = initYouTubeAuth(
@@ -80,11 +107,15 @@ export function YouTubePublishView({
   useEffect(() => {
     if (activeClip) {
       setTitle(activeClip.title);
+      setAlternativeTitles(activeClip.alternativeTitles || []);
       setTagline(activeClip.hookTagline);
       setDescription(activeClip.description);
       setHashtagsText(activeClip.hashtags.join(' '));
+      setTagsText(activeClip.tags?.join(', ') || 'shorts, highlights, stream clips');
       setUploadedVideoId(activeClip.youtubeVideoId || null);
       setUploadError(null);
+      setAiError(null);
+      setAiNotice(null);
     }
   }, [activeClip?.id]);
 
@@ -111,20 +142,49 @@ export function YouTubePublishView({
     onChannelConnected?.(null);
   };
 
-  const handleRegenerateMetadata = () => {
+  const handleGenerateAiMetadata = async (provider: 'auto' | 'anthropic' | 'openai') => {
     if (!activeClip) return;
-    const base = activeClip.title.replace(/#shorts/gi, '').trim();
-    const hooks = [
-      `Wait until the final 3 seconds — ${base}`,
-      `This ${activeClip.durationSec}s clip broke the stream: ${base}`,
-      `Unfiltered reaction: ${base}`,
-    ];
-    const nextTagline = hooks[Math.floor(Math.random() * hooks.length)];
-    setTagline(nextTagline);
-    setTitle(`${base.slice(0, 72)} #Shorts`);
-    setDescription(
-      `${nextTagline}\n\nRendered at ${activeClip.resolution} with clean audio & YouTube auto-captions enabled.\n\n${hashtagsText}`
-    );
+    setAiLoading(true);
+    setAiError(null);
+    setAiNotice(null);
+
+    try {
+      const res = await fetch('/api/youtube/generate-metadata', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider,
+          clipId: activeClip.id,
+          clipTitle: title.trim() || activeClip.title,
+          durationSec: activeClip.durationSec,
+          existingHook: tagline,
+          existingDescription: description,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.suggestion) {
+        throw new Error(
+          data.error || 'AI metadata request failed. You can edit all fields manually.'
+        );
+      }
+
+      const sug = data.suggestion;
+      setTitle(sug.title);
+      setAlternativeTitles(sug.alternativeTitles || []);
+      setTagline(sug.hookTagline || tagline);
+      setDescription(sug.description || description);
+      setHashtagsText((sug.hashtags || []).join(' '));
+      setTagsText((sug.tags || []).join(', '));
+      setAiNotice(`Generated with ${sug.providerUsed}. Review and edit freely before publishing.`);
+    } catch (err) {
+      setAiError(
+        err instanceof Error
+          ? err.message
+          : 'AI metadata unavailable. Continue editing metadata manually.'
+      );
+    } finally {
+      setAiLoading(false);
+    }
   };
 
   const executeUpload = async () => {
@@ -139,18 +199,30 @@ export function YouTubePublishView({
           ? new Date(scheduleDateTime).toISOString()
           : undefined;
 
-      const fullDesc = `${tagline ? `${tagline}\n\n` : ''}${description}\n\n${hashtagsText}`.trim();
-      const tags = hashtagsText
+      const parsedHashtags = hashtagsText
         .split(/[\s,]+/)
         .map((t) => t.trim())
         .filter(Boolean);
+      const parsedSearchTags = tagsText
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean);
+
+      const fullDesc = `${tagline ? `${tagline}\n\n` : ''}${description}\n\n${parsedHashtags.join(' ')}`.trim();
+
+      const combinedYouTubeTags = Array.from(
+        new Set([
+          ...parsedSearchTags,
+          ...parsedHashtags.map((h) => h.replace(/^#/, '')),
+        ])
+      ).filter(Boolean);
 
       const { videoId } = await uploadShortToYouTube({
         accessToken,
         clipDownloadUrl: activeClip.downloadUrl,
         title: title.trim() || activeClip.title,
         description: fullDesc,
-        tags,
+        tags: combinedYouTubeTags,
         privacyStatus,
         publishAtIso,
         onProgress: (pct) => setUploadProgress(pct),
@@ -162,9 +234,11 @@ export function YouTubePublishView({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           title,
+          alternativeTitles,
           hookTagline: tagline,
           description,
-          hashtags: tags,
+          hashtags: parsedHashtags,
+          tags: parsedSearchTags,
           youtubeVideoId: videoId,
           youtubePublishAt: publishAtIso,
           youtubeStatus: publishAtIso ? 'scheduled' : 'published',
@@ -180,6 +254,8 @@ export function YouTubePublishView({
       setUploadProgress(null);
     }
   };
+
+  const anyAiConfigured = aiProviders.anthropic || aiProviders.openai;
 
   return (
     <div className="space-y-6">
@@ -207,7 +283,9 @@ export function YouTubePublishView({
                 </h2>
                 <p className="text-xs text-[#94A3B8] font-mono tabular-nums mt-0.5">
                   {channel.customUrl || channel.id}
-                  {channel.subscriberCount ? ` · ${Number(channel.subscriberCount).toLocaleString()} subscribers` : ''}
+                  {channel.subscriberCount
+                    ? ` · ${Number(channel.subscriberCount).toLocaleString()} subscribers`
+                    : ''}
                   {channel.videoCount ? ` · ${Number(channel.videoCount).toLocaleString()} videos` : ''}
                 </p>
               </>
@@ -289,7 +367,7 @@ export function YouTubePublishView({
           {/* Left: Clip Picker & Video Preview */}
           <section className="lg:col-span-4 bg-[#13161D] border border-[#232834] rounded-xl p-5 space-y-4">
             <label className="block space-y-1.5 text-xs">
-              <span className="font-medium text-[#CBD5E1]">Select Rendered Short</span>
+              <span className="font-medium text-[#CBD5E1]">Select Completed Short</span>
               <select
                 value={activeClip.id}
                 onChange={(e) => onSelectClipId(e.target.value)}
@@ -314,30 +392,74 @@ export function YouTubePublishView({
             </div>
 
             <p className="text-[11px] text-[#94A3B8] text-center font-mono">
-              {activeClip.resolution} · {activeClip.durationSec}s · YouTube Auto-Captions
+              {activeClip.resolution} · {activeClip.durationSec}s
             </p>
           </section>
 
-          {/* Right: Generated Taglines, Description & Upload Schedule */}
+          {/* Right: Metadata Composer + Optional AI Assistant + Upload Schedule */}
           <section className="lg:col-span-8 bg-[#13161D] border border-[#232834] rounded-xl p-6 space-y-5">
-            <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <h3 className="font-display text-base font-semibold text-[#F4F5F7]">
                   Shorts Metadata & Schedule
                 </h3>
                 <p className="text-xs text-[#94A3B8] mt-0.5">
-                  Review your generated title, hook tagline, description, and hashtags before publishing.
+                  Enter metadata manually or optionally generate titles, descriptions, hashtags, and tags with Anthropic / OpenAI.
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={handleRegenerateMetadata}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-lg text-[#F4F5F7] cursor-pointer"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                Refresh Hook & Description
-              </button>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {aiProviders.anthropic && (
+                  <button
+                    type="button"
+                    disabled={aiLoading}
+                    onClick={() => handleGenerateAiMetadata('anthropic')}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-lg text-[#F4F5F7] cursor-pointer disabled:opacity-50"
+                  >
+                    {aiLoading ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Sparkles className="w-3.5 h-3.5 text-rose-400" />
+                    )}
+                    AI Assist (Anthropic)
+                  </button>
+                )}
+
+                {aiProviders.openai && (
+                  <button
+                    type="button"
+                    disabled={aiLoading}
+                    onClick={() => handleGenerateAiMetadata('openai')}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-lg text-[#F4F5F7] cursor-pointer disabled:opacity-50"
+                  >
+                    {aiLoading ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+                    )}
+                    AI Assist (OpenAI)
+                  </button>
+                )}
+
+                {!anyAiConfigured && (
+                  <span className="text-[11px] text-[#64748B] bg-[#0E1016] border border-[#232834] rounded-md px-2.5 py-1">
+                    Manual mode (set ANTHROPIC_API_KEY or OPENAI_API_KEY on server for AI Assist)
+                  </span>
+                )}
+              </div>
             </div>
+
+            {aiNotice && (
+              <div className="px-3 py-2 text-xs text-emerald-300 bg-emerald-950/35 border border-emerald-700/50 rounded-lg">
+                {aiNotice}
+              </div>
+            )}
+
+            {aiError && (
+              <div className="px-3 py-2 text-xs text-amber-200 bg-amber-950/40 border border-amber-700/60 rounded-lg">
+                {aiError}
+              </div>
+            )}
 
             <div className="space-y-4 text-xs">
               <label className="block space-y-1.5">
@@ -351,8 +473,28 @@ export function YouTubePublishView({
                 />
               </label>
 
+              {alternativeTitles.length > 0 && (
+                <div className="space-y-1.5">
+                  <span className="font-medium text-[#94A3B8]">
+                    Alternative Title Suggestions (click to use)
+                  </span>
+                  <div className="flex flex-wrap gap-2">
+                    {alternativeTitles.map((alt) => (
+                      <button
+                        key={alt}
+                        type="button"
+                        onClick={() => setTitle(alt)}
+                        className="px-2.5 py-1.5 text-left text-xs bg-[#0E1016] hover:bg-[#1B202C] border border-[#232834] hover:border-rose-500/60 rounded-md text-[#CBD5E1] cursor-pointer"
+                      >
+                        {alt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <label className="block space-y-1.5">
-                <span className="font-medium text-[#CBD5E1]">Generated Hook Tagline</span>
+                <span className="font-medium text-[#CBD5E1]">Hook Tagline</span>
                 <input
                   type="text"
                   value={tagline}
@@ -371,15 +513,29 @@ export function YouTubePublishView({
                 />
               </label>
 
-              <label className="block space-y-1.5">
-                <span className="font-medium text-[#CBD5E1]">Hashtags / Tags</span>
-                <input
-                  type="text"
-                  value={hashtagsText}
-                  onChange={(e) => setHashtagsText(e.target.value)}
-                  className="w-full px-3 py-2 bg-[#0E1016] border border-[#232834] focus:border-rose-500 rounded-lg text-xs font-mono text-[#F4F5F7] outline-none"
-                />
-              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <label className="block space-y-1.5">
+                  <span className="font-medium text-[#CBD5E1]">Hashtags</span>
+                  <input
+                    type="text"
+                    value={hashtagsText}
+                    onChange={(e) => setHashtagsText(e.target.value)}
+                    placeholder="#shorts #gaming #highlights"
+                    className="w-full px-3 py-2 bg-[#0E1016] border border-[#232834] focus:border-rose-500 rounded-lg text-xs font-mono text-[#F4F5F7] outline-none"
+                  />
+                </label>
+
+                <label className="block space-y-1.5">
+                  <span className="font-medium text-[#CBD5E1]">Searchable Tags (comma-separated)</span>
+                  <input
+                    type="text"
+                    value={tagsText}
+                    onChange={(e) => setTagsText(e.target.value)}
+                    placeholder="shorts, highlights, stream clips"
+                    className="w-full px-3 py-2 bg-[#0E1016] border border-[#232834] focus:border-rose-500 rounded-lg text-xs font-mono text-[#F4F5F7] outline-none"
+                  />
+                </label>
+              </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-[#232834]">
                 <label className="block space-y-1.5">
@@ -480,10 +636,10 @@ export function YouTubePublishView({
         <div className="bg-[#13161D] border border-[#232834] rounded-xl p-10 text-center space-y-2">
           <UploadCloud className="w-7 h-7 text-[#64748B] mx-auto" />
           <h3 className="font-display text-base font-semibold text-[#F4F5F7]">
-            No Rendered Clip Selected
+            No Completed Clip Selected
           </h3>
           <p className="text-sm text-[#94A3B8]">
-            Render a 9:16 vertical Short first, then return here to upload it directly to your YouTube channel.
+            Render a 9:16 vertical Short first in Create Clips, then return here to upload it directly to your YouTube channel.
           </p>
         </div>
       )}
@@ -496,8 +652,12 @@ export function YouTubePublishView({
               Confirm YouTube Upload
             </h3>
             <p className="text-sm text-[#94A3B8]">
-              Upload <span className="text-[#F4F5F7] font-medium">“{title || activeClip.title}”</span> ({activeClip.durationSec}s) to channel{' '}
-              <span className="text-[#F4F5F7] font-medium">{channel?.title || 'Connected Channel'}</span> as{' '}
+              Upload <span className="text-[#F4F5F7] font-medium">“{title || activeClip.title}”</span> (
+              {activeClip.durationSec}s) to channel{' '}
+              <span className="text-[#F4F5F7] font-medium">
+                {channel?.title || 'Connected Channel'}
+              </span>{' '}
+              as{' '}
               <span className="text-[#F4F5F7] font-medium">
                 {scheduleEnabled && scheduleDateTime
                   ? `Scheduled (${new Date(scheduleDateTime).toLocaleString()})`

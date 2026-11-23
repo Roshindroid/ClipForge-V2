@@ -1,34 +1,34 @@
-import { useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Camera,
   Check,
+  CheckSquare,
   Film,
   Layers,
-  ShieldCheck,
-  Sparkles,
+  Play,
+  RefreshCw,
+  RotateCcw,
+  Square,
+  Trash2,
+  Video,
 } from 'lucide-react';
 import type {
-  AppSettings,
   BrandingConfig,
+  ClipProject,
   FacecamBox,
   LayoutId,
-  RenderedClip,
+  ProjectSegment,
   TemplateId,
-  VideoProject,
-  ViralMoment,
 } from '../types';
 import { LAYOUT_OPTIONS } from '../types';
-import { formatTimecode, pollJobUntilDone } from '../lib/jobs';
+import { formatSecondsToTimecode } from '../lib/timestampParser';
 import { LayoutThumbnail } from './LayoutThumbnail';
 
 interface FacecamLayoutStudioProps {
-  project: VideoProject | null;
-  moment: ViralMoment | null;
-  appSettings: AppSettings;
-  onSelectMoment: (moment: ViralMoment) => void;
-  onProjectUpdated: (project: VideoProject) => void;
-  onClipRendered: (clip: RenderedClip, updatedProject?: VideoProject) => void;
-  onBatchClipsRendered?: (clips: RenderedClip[], updatedProject?: VideoProject) => void;
+  project: ClipProject;
+  onProjectUpdated: (project: ClipProject) => void;
+  onGoToMyClips: () => void;
 }
 
 const TEMPLATES: Array<{ id: TemplateId; label: string; desc: string }> = [
@@ -38,411 +38,1132 @@ const TEMPLATES: Array<{ id: TemplateId; label: string; desc: string }> = [
   { id: 'breaking-news', label: 'Breaking News', desc: 'Lower broadcast chyron' },
 ];
 
+type HandleDir = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+
+function clamp(val: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, val));
+}
+
+function clampBox(box: FacecamBox): FacecamBox {
+  const width = clamp(box.width, 0.05, 1);
+  const height = clamp(box.height, 0.05, 1);
+  const x = clamp(box.x, 0, Math.max(0, 1 - width));
+  const y = clamp(box.y, 0, Math.max(0, 1 - height));
+  return {
+    x: Math.round(x * 1000) / 1000,
+    y: Math.round(y * 1000) / 1000,
+    width: Math.round(width * 1000) / 1000,
+    height: Math.round(height * 1000) / 1000,
+  };
+}
+
+function formatBytes(bytes?: number): string {
+  if (!bytes || bytes <= 0) return '—';
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
 export function FacecamLayoutStudio({
   project,
-  moment,
-  appSettings,
-  onSelectMoment,
   onProjectUpdated,
-  onClipRendered,
-  onBatchClipsRendered,
+  onGoToMyClips,
 }: FacecamLayoutStudioProps) {
-  const activeMoment = moment || project?.moments[0] || null;
-  const [frameIndex, setFrameIndex] = useState(0);
-  const [facecamBox, setFacecamBox] = useState<FacecamBox>(
-    project?.detectedFacecam || {
-      x: 0.72,
-      y: 0.65,
-      width: 0.25,
-      height: 0.3,
-      confidence: 0.85,
-      presetLabel: 'Bottom-Right Cam',
-    }
+  const [activeSegmentId, setActiveSegmentId] = useState<string>(
+    project.segments[0]?.id || ''
   );
-  const [layoutId, setLayoutId] = useState<LayoutId>('split-top-cam');
-  const [templateId, setTemplateId] = useState<TemplateId>('none');
-  const [branding, setBranding] = useState<BrandingConfig>({
-    creditText: '@clipforge',
-    backgroundHex: '#0B0D11',
-    watermarkText: '',
-  });
+  const [selectedSegmentIds, setSelectedSegmentIds] = useState<string[]>(() =>
+    project.segments.filter((s) => s.downloadStatus === 'ready').map((s) => s.id)
+  );
 
-  const [clipTitle, setClipTitle] = useState(activeMoment?.title || '');
-  const [clipHook, setClipHook] = useState(activeMoment?.hookTagline || '');
-  const [isRendering, setIsRendering] = useState(false);
-  const [renderStage, setRenderStage] = useState('');
-  const [renderProgress, setRenderProgress] = useState(0);
-  const [isSavingCam, setIsSavingCam] = useState(false);
-  const [renderError, setRenderError] = useState<string | null>(null);
-  const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const activeSegment: ProjectSegment | undefined =
+    project.segments.find((s) => s.id === activeSegmentId) || project.segments[0];
 
-  const prevProjectId = useRef<string | null>(null);
-  const prevMomentId = useRef<string | null>(null);
-  if (project && prevProjectId.current !== project.id) {
-    prevProjectId.current = project.id;
-    setFacecamBox(project.detectedFacecam);
-    setFrameIndex(0);
-  }
-  if (activeMoment && prevMomentId.current !== activeMoment.id) {
-    prevMomentId.current = activeMoment.id;
-    setClipTitle(activeMoment.title);
-    setClipHook(activeMoment.hookTagline);
-  }
+  // Local editing state synced to active segment / project defaults
+  const resolvedFacecam: FacecamBox | null = activeSegment
+    ? activeSegment.hasCustomFacecam
+      ? activeSegment.facecamBox
+      : (activeSegment.facecamBox ?? project.sharedFacecamBox)
+    : project.sharedFacecamBox;
 
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const handleFrameMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const startX = e.clientX;
-    const startY = e.clientY;
-    const origX = facecamBox.x;
-    const origY = facecamBox.y;
+  const resolvedLayout: LayoutId = activeSegment
+    ? activeSegment.hasCustomLayout
+      ? activeSegment.layoutId
+      : project.sharedLayoutId
+    : project.sharedLayoutId;
 
-    const onMove = (moveEvent: MouseEvent) => {
-      const dx = (moveEvent.clientX - startX) / rect.width;
-      const dy = (moveEvent.clientY - startY) / rect.height;
-      setFacecamBox((prev) => ({
-        ...prev,
-        x: Math.round(Math.max(0, Math.min(1 - prev.width, origX + dx)) * 100) / 100,
-        y: Math.round(Math.max(0, Math.min(1 - prev.height, origY + dy)) * 100) / 100,
-        presetLabel: 'Custom Drag Region',
-        confidence: 1,
-      }));
+  const [draftBox, setDraftBox] = useState<FacecamBox | null>(resolvedFacecam);
+  const [draftLayoutId, setDraftLayoutId] = useState<LayoutId>(resolvedLayout);
+  const [templateId, setTemplateId] = useState<TemplateId>(project.templateId);
+  const [resolution, setResolution] = useState<'1080x1920' | '720x1280'>(project.resolution);
+  const [frameRate, setFrameRate] = useState<'original' | '60' | '30'>(project.frameRate);
+  const [branding, setBranding] = useState<BrandingConfig>(project.branding);
+  const [clipTitle, setClipTitle] = useState<string>(activeSegment?.title || '');
+  const [clipHook, setClipHook] = useState<string>(activeSegment?.hookTagline || '');
+
+  const [frameFraction, setFrameFraction] = useState<number>(0.5);
+  const [activeFrameUrl, setActiveFrameUrl] = useState<string>(
+    activeSegment?.frameUrl || ''
+  );
+  const [isDraggingBox, setIsDraggingBox] = useState(false);
+
+  // Live FFmpeg 9:16 preview states
+  const [previewImgUrl, setPreviewImgUrl] = useState<string | null>(null);
+  const [previewImgLoading, setPreviewImgLoading] = useState(false);
+  const [previewImgError, setPreviewImgError] = useState<string | null>(null);
+  const [previewVideoUrl, setPreviewVideoUrl] = useState<string | null>(null);
+  const [previewVideoLoading, setPreviewVideoLoading] = useState(false);
+
+  // Source modal player for reviewing downloaded segment
+  const [sourcePreviewSeg, setSourcePreviewSeg] = useState<ProjectSegment | null>(null);
+
+  // Status & actions
+  const [savingNotice, setSavingNotice] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [submittingRender, setSubmittingRender] = useState(false);
+
+  // Sync local editor when project ID or activeSegment ID changes
+  const lastSyncRef = useRef<string>('');
+  useEffect(() => {
+    const key = `${project.id}:${activeSegment?.id || ''}`;
+    if (lastSyncRef.current !== key) {
+      lastSyncRef.current = key;
+      const seg = project.segments.find((s) => s.id === activeSegment?.id) || project.segments[0];
+      const nextCam = seg
+        ? seg.hasCustomFacecam
+          ? seg.facecamBox
+          : (seg.facecamBox ?? project.sharedFacecamBox)
+        : project.sharedFacecamBox;
+      const nextLayout = seg
+        ? seg.hasCustomLayout
+          ? seg.layoutId
+          : project.sharedLayoutId
+        : project.sharedLayoutId;
+      setDraftBox(nextCam);
+      setDraftLayoutId(nextLayout);
+      setTemplateId(project.templateId);
+      setResolution(project.resolution);
+      setFrameRate(project.frameRate);
+      setBranding(project.branding);
+      setClipTitle(seg?.title || '');
+      setClipHook(seg?.hookTagline || '');
+      setFrameFraction(0.5);
+      setActiveFrameUrl(seg?.frameUrl || '');
+      setPreviewVideoUrl(null);
+      setActionError(null);
+    }
+  }, [project, activeSegment?.id]);
+
+  // Keep activeFrameUrl updated once a segment finishes downloading
+  useEffect(() => {
+    if (activeSegment?.frameUrl && frameFraction === 0.5) {
+      setActiveFrameUrl(activeSegment.frameUrl);
+    }
+  }, [activeSegment?.frameUrl, frameFraction]);
+
+  // Ensure selectedSegmentIds stays valid when segments change
+  useEffect(() => {
+    const validIds = new Set(project.segments.map((s) => s.id));
+    setSelectedSegmentIds((prev) => {
+      const filtered = prev.filter((id) => validIds.has(id));
+      if (filtered.length === 0 && project.segments.some((s) => s.downloadStatus === 'ready')) {
+        return project.segments.filter((s) => s.downloadStatus === 'ready').map((s) => s.id);
+      }
+      return filtered;
+    });
+  }, [project.segments]);
+
+  const prevPreviewUrlRef = useRef<string | null>(null);
+
+  // Fetch exact FFmpeg 9:16 composite preview whenever layout/box/template/branding/frame settles
+  useEffect(() => {
+    if (
+      !activeSegment ||
+      activeSegment.downloadStatus !== 'ready' ||
+      !activeFrameUrl ||
+      isDraggingBox
+    ) {
+      return;
+    }
+
+    const layoutMeta = LAYOUT_OPTIONS.find((l) => l.id === draftLayoutId);
+    if (layoutMeta?.usesFacecam && !draftBox) {
+      setPreviewImgError(
+        'Draw a facecam box in Panel 1 to preview this layout, or choose Center Crop.'
+      );
+      if (prevPreviewUrlRef.current) {
+        URL.revokeObjectURL(prevPreviewUrlRef.current);
+        prevPreviewUrlRef.current = null;
+      }
+      setPreviewImgUrl(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      setPreviewImgLoading(true);
+      setPreviewImgError(null);
+      try {
+        const res = await fetch(
+          `/api/projects/${project.id}/segments/${activeSegment.id}/preview-frame`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+              layoutId: draftLayoutId,
+              templateId,
+              facecamBox: draftBox,
+              branding,
+              hookTagline: clipHook || clipTitle || activeSegment.title,
+              fraction: frameFraction,
+            }),
+          }
+        );
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || 'Could not render preview');
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        if (prevPreviewUrlRef.current) {
+          URL.revokeObjectURL(prevPreviewUrlRef.current);
+        }
+        prevPreviewUrlRef.current = url;
+        setPreviewImgUrl(url);
+      } catch (err) {
+        if ((err as Error).name !== 'AbortError') {
+          setPreviewImgError(err instanceof Error ? err.message : 'Preview error');
+        }
+      } finally {
+        setPreviewImgLoading(false);
+      }
+    }, 160);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [
+    project.id,
+    activeSegment?.id,
+    activeSegment?.downloadStatus,
+    activeFrameUrl,
+    draftBox,
+    draftLayoutId,
+    templateId,
+    branding,
+    clipHook,
+    clipTitle,
+    frameFraction,
+    isDraggingBox,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      if (prevPreviewUrlRef.current) {
+        URL.revokeObjectURL(prevPreviewUrlRef.current);
+      }
+    };
+  }, []);
+
+  // Fast 60fps canvas fallback ONLY while dragging/resizing box
+  const dragCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const sourceImgRef = useRef<HTMLImageElement | null>(null);
+
+  useEffect(() => {
+    if (!isDraggingBox || !draftBox || !activeFrameUrl) return;
+    const canvas = dragCanvasRef.current;
+    const img = sourceImgRef.current;
+    if (!canvas || !img || !img.complete || img.naturalWidth === 0) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const W = canvas.width;
+    const H = canvas.height;
+    ctx.fillStyle = branding.backgroundHex || '#0B0D11';
+    ctx.fillRect(0, 0, W, H);
+
+    const iw = img.naturalWidth;
+    const ih = img.naturalHeight;
+    const cx = draftBox.x * iw;
+    const cy = draftBox.y * ih;
+    const cw = Math.max(8, draftBox.width * iw);
+    const ch = Math.max(8, draftBox.height * ih);
+
+    const drawCover = (
+      sx: number,
+      sy: number,
+      sw: number,
+      sh: number,
+      dx: number,
+      dy: number,
+      dw: number,
+      dh: number
+    ) => {
+      const srcAspect = sw / Math.max(1, sh);
+      const dstAspect = dw / Math.max(1, dh);
+      let rx = sx,
+        ry = sy,
+        rw = sw,
+        rh = sh;
+      if (srcAspect > dstAspect) {
+        rw = sh * dstAspect;
+        rx = sx + (sw - rw) / 2;
+      } else {
+        rh = sw / dstAspect;
+        ry = sy + (sh - rh) / 2;
+      }
+      ctx.drawImage(img, rx, ry, rw, rh, dx, dy, dw, dh);
     };
 
-    const onUp = () => {
+    if (draftLayoutId === 'center-crop-focus') {
+      drawCover(0, 0, iw, ih, 0, 0, W, H);
+    } else if (draftLayoutId === 'facecam-only-zoom') {
+      drawCover(cx, cy, cw, ch, 0, 0, W, H);
+    } else if (
+      draftLayoutId === 'split-top-cam' ||
+      draftLayoutId === 'split-bottom-cam' ||
+      draftLayoutId === 'split-50-50'
+    ) {
+      const camH = draftLayoutId === 'split-50-50' ? H * 0.5 : H * 0.35;
+      const mainH = H - camH;
+      if (draftLayoutId === 'split-bottom-cam') {
+        drawCover(0, 0, iw, ih, 0, 0, W, mainH);
+        drawCover(cx, cy, cw, ch, 0, mainH, W, camH);
+      } else {
+        drawCover(cx, cy, cw, ch, 0, 0, W, camH);
+        drawCover(0, 0, iw, ih, 0, camH, W, mainH);
+      }
+    } else if (draftLayoutId.startsWith('pip-')) {
+      drawCover(0, 0, iw, ih, 0, 0, W, H);
+      const pw = Math.round(W * 0.31);
+      const ph = pw;
+      const mx = Math.round(W * 0.04);
+      const topY = Math.round(H * 0.11);
+      const botY = H - ph - Math.round(H * 0.14);
+      const px = draftLayoutId.endsWith('right') ? W - pw - mx : mx;
+      const py = draftLayoutId.includes('top') ? topY : botY;
+      drawCover(cx, cy, cw, ch, px, py, pw, ph);
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(px, py, pw, ph);
+    } else {
+      ctx.save();
+      ctx.filter = 'blur(8px)';
+      drawCover(0, 0, iw, ih, 0, 0, W, H);
+      ctx.restore();
+      const fitH = Math.round((W * ih) / Math.max(1, iw));
+      const fy = Math.round((H - fitH) / 2);
+      ctx.drawImage(img, 0, 0, iw, ih, 0, fy, W, fitH);
+      const cwOut = Math.round(W * 0.39);
+      const chOut = Math.round(H * 0.18);
+      const cxOut = Math.round((W - cwOut) / 2);
+      const cyOut =
+        draftLayoutId === 'blurred-bg-cam-top'
+          ? Math.round(H * 0.085)
+          : H - chOut - Math.round(H * 0.1);
+      drawCover(cx, cy, cw, ch, cxOut, cyOut, cwOut, chOut);
+      ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(cxOut, cyOut, cwOut, chOut);
+    }
+  }, [isDraggingBox, draftBox, draftLayoutId, activeFrameUrl, branding.backgroundHex]);
+
+  // --- Frame Interactive Draw / Drag / 8-Handle Resize ---
+  const frameContainerRef = useRef<HTMLDivElement | null>(null);
+
+  const handleDrawNewBoxMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !activeSegment || activeSegment.downloadStatus !== 'ready') return;
+    const rect = frameContainerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    e.preventDefault();
+
+    const startClientX = e.clientX;
+    const startClientY = e.clientY;
+    const normStartX = clamp((startClientX - rect.left) / rect.width, 0, 0.95);
+    const normStartY = clamp((startClientY - rect.top) / rect.height, 0, 0.95);
+    setIsDraggingBox(true);
+    setPreviewVideoUrl(null);
+
+    const onMove = (ev: MouseEvent) => {
+      const curX = clamp((ev.clientX - rect.left) / rect.width, 0, 1);
+      const curY = clamp((ev.clientY - rect.top) / rect.height, 0, 1);
+      const left = Math.min(normStartX, curX);
+      const top = Math.min(normStartY, curY);
+      const width = Math.max(0.05, Math.abs(curX - normStartX));
+      const height = Math.max(0.05, Math.abs(curY - normStartY));
+      setDraftBox(clampBox({ x: left, y: top, width, height }));
+    };
+
+    const onUp = (ev: MouseEvent) => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      const dx = Math.abs(ev.clientX - startClientX);
+      const dy = Math.abs(ev.clientY - startClientY);
+      if (dx < 6 && dy < 6) {
+        // Simple click without drag: center a 24%x28% box around click point
+        const clickX = clamp((ev.clientX - rect.left) / rect.width, 0, 1);
+        const clickY = clamp((ev.clientY - rect.top) / rect.height, 0, 1);
+        const w = draftBox?.width || 0.24;
+        const h = draftBox?.height || 0.28;
+        setDraftBox(clampBox({ x: clickX - w / 2, y: clickY - h / 2, width: w, height: h }));
+      }
+      setIsDraggingBox(false);
     };
 
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   };
 
-  if (!project || !activeMoment) {
-    return (
-      <div className="bg-[#13161D] border border-[#232834] rounded-xl p-10 text-center space-y-2">
-        <Camera className="w-7 h-7 text-[#64748B] mx-auto" />
-        <h3 className="font-display text-base font-semibold text-[#F4F5F7]">
-          Inspect a Link First
-        </h3>
-        <p className="text-sm text-[#94A3B8]">
-          Start in Discover Moments to inspect a video link, pick your best moments, and configure your 9:16 layout.
-        </p>
-      </div>
+  const handleMoveBoxMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !draftBox) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const rect = frameContainerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const orig = { ...draftBox };
+    setIsDraggingBox(true);
+    setPreviewVideoUrl(null);
+
+    const onMove = (ev: MouseEvent) => {
+      const dx = (ev.clientX - startX) / rect.width;
+      const dy = (ev.clientY - startY) / rect.height;
+      setDraftBox(
+        clampBox({
+          x: clamp(orig.x + dx, 0, 1 - orig.width),
+          y: clamp(orig.y + dy, 0, 1 - orig.height),
+          width: orig.width,
+          height: orig.height,
+        })
+      );
+    };
+
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      setIsDraggingBox(false);
+    };
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const handleResizeMouseDown = (dir: HandleDir, e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !draftBox) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const rect = frameContainerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const orig = { ...draftBox };
+    const origRight = orig.x + orig.width;
+    const origBottom = orig.y + orig.height;
+    setIsDraggingBox(true);
+    setPreviewVideoUrl(null);
+
+    const onMove = (ev: MouseEvent) => {
+      const dx = (ev.clientX - startX) / rect.width;
+      const dy = (ev.clientY - startY) / rect.height;
+
+      let left = orig.x;
+      let top = orig.y;
+      let right = origRight;
+      let bottom = origBottom;
+
+      if (dir.includes('w')) left = clamp(orig.x + dx, 0, origRight - 0.05);
+      if (dir.includes('e')) right = clamp(origRight + dx, orig.x + 0.05, 1);
+      if (dir.includes('n')) top = clamp(orig.y + dy, 0, origBottom - 0.05);
+      if (dir.includes('s')) bottom = clamp(origBottom + dy, orig.y + 0.05, 1);
+
+      setDraftBox(
+        clampBox({
+          x: left,
+          y: top,
+          width: right - left,
+          height: bottom - top,
+        })
+      );
+    };
+
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      setIsDraggingBox(false);
+    };
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  // --- API Persistence Actions ---
+
+  const flashNotice = (msg: string) => {
+    setSavingNotice(msg);
+    setTimeout(() => setSavingNotice((curr) => (curr === msg ? null : curr)), 2600);
+  };
+
+  const handleScrubFrame = async (frac: number) => {
+    if (!activeSegment || activeSegment.downloadStatus !== 'ready') return;
+    setFrameFraction(frac);
+    try {
+      const res = await fetch(
+        `/api/projects/${project.id}/segments/${activeSegment.id}/frame?fraction=${frac}`
+      );
+      const data = await res.json();
+      if (res.ok && data.frameUrl) {
+        setActiveFrameUrl(data.frameUrl);
+      }
+    } catch {
+      // ignore scrub error
+    }
+  };
+
+  const handleSaveFacecamSegment = async () => {
+    if (!activeSegment) return;
+    setActionError(null);
+    const res = await fetch(
+      `/api/projects/${project.id}/segments/${activeSegment.id}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          facecamBox: draftBox,
+          hasCustomFacecam: true,
+          title: clipTitle.trim() || activeSegment.title,
+          hookTagline: clipHook,
+        }),
+      }
     );
-  }
+    const data = await res.json();
+    if (res.ok && data.project) {
+      onProjectUpdated(data.project);
+      flashNotice('Saved to segment');
+    } else {
+      setActionError(data.error || 'Could not save facecam box.');
+    }
+  };
 
-  const activeFrameUrl = project.previewFrames[frameIndex] || project.previewFrames[0] || '';
-  const selectedLayoutMeta = LAYOUT_OPTIONS.find((l) => l.id === layoutId) || LAYOUT_OPTIONS[0];
-  const selectedMoments = project.moments.filter((m) => m.selected);
-  const batchTargetMoments = selectedMoments.length > 0 ? selectedMoments : project.moments;
-  const localDeleted = project.sourceMode === 'local' && Boolean(project.sourceDeleted);
+  const handleApplyFacecamBulk = async (target: 'selected' | 'all') => {
+    setActionError(null);
+    const body =
+      target === 'all'
+        ? { facecamBox: draftBox }
+        : { facecamBox: draftBox, segmentIds: selectedSegmentIds };
+    const res = await fetch(`/api/projects/${project.id}/apply-facecam`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (res.ok && data.project) {
+      onProjectUpdated(data.project);
+      flashNotice(target === 'all' ? 'Facecam applied to all' : 'Facecam applied to selected');
+    } else {
+      setActionError(data.error || 'Could not apply facecam region.');
+    }
+  };
 
-  const handleSaveFacecam = async () => {
-    setIsSavingCam(true);
-    setSavedNotice(null);
+  const persistProjectSettings = async (patch: Record<string, unknown>) => {
+    const res = await fetch(`/api/projects/${project.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    const data = await res.json();
+    if (res.ok && data.project) {
+      onProjectUpdated(data.project);
+    }
+  };
+
+  const handleSelectLayout = async (nextLayoutId: LayoutId) => {
+    setDraftLayoutId(nextLayoutId);
+    setPreviewVideoUrl(null);
+    if (!activeSegment) return;
+    const res = await fetch(
+      `/api/projects/${project.id}/segments/${activeSegment.id}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          layoutId: nextLayoutId,
+          hasCustomLayout: true,
+        }),
+      }
+    );
+    const data = await res.json();
+    if (res.ok && data.project) {
+      onProjectUpdated(data.project);
+    }
+  };
+
+  const handleApplyLayoutBulk = async (target: 'selected' | 'all') => {
+    setActionError(null);
+    const body =
+      target === 'all'
+        ? { layoutId: draftLayoutId }
+        : { layoutId: draftLayoutId, segmentIds: selectedSegmentIds };
+    const res = await fetch(`/api/projects/${project.id}/apply-layout`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (res.ok && data.project) {
+      onProjectUpdated(data.project);
+      flashNotice(target === 'all' ? 'Layout applied to all' : 'Layout applied to selected');
+    } else {
+      setActionError(data.error || 'Could not apply layout.');
+    }
+  };
+
+  const handleSaveSegmentMeta = async () => {
+    if (!activeSegment) return;
+    await fetch(`/api/projects/${project.id}/segments/${activeSegment.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: clipTitle.trim() || activeSegment.title,
+        hookTagline: clipHook,
+      }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.project) onProjectUpdated(d.project);
+      })
+      .catch(() => {});
+  };
+
+  const handleRetrySegmentDownload = async (segmentId: string) => {
+    setActionError(null);
+    const res = await fetch(`/api/projects/${project.id}/download-segments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segmentIds: [segmentId] }),
+    });
+    const data = await res.json();
+    if (res.ok && data.project) {
+      onProjectUpdated(data.project);
+    } else {
+      setActionError(data.error || 'Could not restart segment download.');
+    }
+  };
+
+  const handleGenerateVideoPreview = async () => {
+    if (!activeSegment || activeSegment.downloadStatus !== 'ready') return;
+    setPreviewVideoLoading(true);
+    setActionError(null);
     try {
-      const res = await fetch(`/api/projects/${project.id}/facecam`, {
+      const res = await fetch(
+        `/api/projects/${project.id}/segments/${activeSegment.id}/preview-video`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            layoutId: draftLayoutId,
+            templateId,
+            facecamBox: draftBox,
+            branding,
+            hookTagline: clipHook || clipTitle || activeSegment.title,
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Video preview failed');
+      setPreviewVideoUrl(`${data.previewUrl}?t=${Date.now()}`);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Video preview failed');
+    } finally {
+      setPreviewVideoLoading(false);
+    }
+  };
+
+  const handleStartRender = async (mode: 'selected' | 'all') => {
+    setActionError(null);
+    setSubmittingRender(true);
+    try {
+      // Save any pending text edits + project branding/template/res/fps first
+      await handleSaveSegmentMeta();
+      await persistProjectSettings({
+        templateId,
+        resolution,
+        frameRate,
+        branding,
+      });
+
+      const targetIds =
+        mode === 'all'
+          ? project.segments.filter((s) => s.downloadStatus === 'ready').map((s) => s.id)
+          : selectedSegmentIds;
+
+      const res = await fetch(`/api/projects/${project.id}/render`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ facecamBox }),
+        body: JSON.stringify({ segmentIds: targetIds }),
       });
       const data = await res.json();
-      if (res.ok && data.project) {
+      if (!res.ok) {
+        throw new Error(data.error || 'Could not start rendering.');
+      }
+      if (data.project) {
         onProjectUpdated(data.project);
-        setSavedNotice('Saved');
-        setTimeout(() => setSavedNotice(null), 2500);
       }
-    } finally {
-      setIsSavingCam(false);
-    }
-  };
-
-  const handleRenderClip = async () => {
-    setIsRendering(true);
-    setRenderError(null);
-    setRenderStage('Starting render...');
-    setRenderProgress(5);
-    try {
-      const res = await fetch('/api/clips/render', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          projectId: project.id,
-          momentId: activeMoment.id,
-          layoutId,
-          templateId,
-          facecamBox,
-          branding,
-          title: clipTitle.trim() || activeMoment.title,
-          hookTagline: clipHook.trim() || activeMoment.hookTagline,
-          description: activeMoment.description,
-          hashtags: activeMoment.hashtags,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Render failed');
-
-      let renderedClip = data.clip;
-      let updatedProject = data.project as VideoProject | undefined;
-      if (data.jobId) {
-        const done = await pollJobUntilDone(data.jobId, (job) => {
-          setRenderProgress(job.progress);
-          setRenderStage(job.stage);
-        });
-        renderedClip = done.clip;
-        if (done.project) updatedProject = done.project;
-      }
-
-      if (!renderedClip) throw new Error('Render finished without output clip.');
-      onClipRendered(renderedClip, updatedProject);
+      flashNotice(`Queued ${data.queuedCount} clip(s)`);
     } catch (err) {
-      setRenderError(err instanceof Error ? err.message : 'FFmpeg render failed');
+      setActionError(err instanceof Error ? err.message : 'Render validation failed');
     } finally {
-      setIsRendering(false);
-      setRenderStage('');
-      setRenderProgress(0);
+      setSubmittingRender(false);
     }
   };
 
-  const handleRenderSelectedBatch = async () => {
-    if (batchTargetMoments.length === 0) return;
-    setIsRendering(true);
-    setRenderError(null);
-    setRenderStage(`Queueing ${batchTargetMoments.length} clip(s)...`);
-    setRenderProgress(4);
+  const readySegments = useMemo(
+    () => project.segments.filter((s) => s.downloadStatus === 'ready'),
+    [project.segments]
+  );
 
-    try {
-      const res = await fetch('/api/clips/render-batch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          projectId: project.id,
-          momentIds: batchTargetMoments.map((m) => m.id),
-          layoutId,
-          templateId,
-          facecamBox,
-          branding,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Batch render failed');
+  const anyRendering = project.segments.some(
+    (s) => s.renderStatus === 'queued' || s.renderStatus === 'rendering'
+  );
+  const completedCount = project.segments.filter(
+    (s) => s.renderStatus === 'completed'
+  ).length;
 
-      const jobIds: string[] = data.jobIds || [];
-      const renderedClips: RenderedClip[] = [];
-      let updatedProject: VideoProject | undefined;
+  const selectedLayoutMeta =
+    LAYOUT_OPTIONS.find((l) => l.id === draftLayoutId) || LAYOUT_OPTIONS[0];
 
-      for (let i = 0; i < jobIds.length; i++) {
-        const done = await pollJobUntilDone(jobIds[i], (job) => {
-          const overall = Math.round(((i + job.progress / 100) / jobIds.length) * 100);
-          setRenderProgress(overall);
-          setRenderStage(`Clip ${i + 1}/${jobIds.length}: ${job.stage}`);
-        });
-        if (done.clip) renderedClips.push(done.clip);
-        if (done.project) updatedProject = done.project;
-      }
+  const srcWidth = activeSegment?.width || project.width || 1920;
+  const srcHeight = activeSegment?.height || project.height || 1080;
 
-      if (onBatchClipsRendered) {
-        onBatchClipsRendered(renderedClips, updatedProject);
-      } else if (renderedClips[0]) {
-        onClipRendered(renderedClips[0], updatedProject);
-      }
-    } catch (err) {
-      setRenderError(err instanceof Error ? err.message : 'Batch render failed');
-    } finally {
-      setIsRendering(false);
-      setRenderStage('');
-      setRenderProgress(0);
-    }
+  // Check missing facecam warnings for selected segments
+  const missingFacecamWarnings = useMemo(() => {
+    const ids = new Set(selectedSegmentIds);
+    return project.segments.filter((s) => {
+      if (!ids.has(s.id) || s.downloadStatus !== 'ready') return false;
+      const effLayout = s.hasCustomLayout ? s.layoutId : project.sharedLayoutId;
+      if (effLayout === 'center-crop-focus') return false;
+      const effCam =
+        s.id === activeSegment?.id
+          ? draftBox
+          : s.hasCustomFacecam
+            ? s.facecamBox
+            : (s.facecamBox ?? project.sharedFacecamBox);
+      return !effCam;
+    });
+  }, [project, selectedSegmentIds, activeSegment?.id, draftBox]);
+
+  const toggleSelectSegment = (id: string) => {
+    setSelectedSegmentIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
   };
-
-  const camBgStyle: React.CSSProperties = activeFrameUrl
-    ? {
-        backgroundImage: `url(${activeFrameUrl})`,
-        backgroundSize: `${Math.round(100 / Math.max(0.1, facecamBox.width))}% ${Math.round(
-          100 / Math.max(0.1, facecamBox.height)
-        )}%`,
-        backgroundPosition: `${Math.round(
-          (facecamBox.x / Math.max(0.01, 1 - facecamBox.width)) * 100
-        )}% ${Math.round((facecamBox.y / Math.max(0.01, 1 - facecamBox.height)) * 100)}%`,
-      }
-    : {};
 
   return (
-    <div className="space-y-6">
-      <div className="bg-[#13161D] border border-[#232834] rounded-xl p-4 flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-3 min-w-0">
-          <span className="text-xs font-medium text-[#94A3B8] shrink-0">Active Moment:</span>
-          <select
-            value={activeMoment.id}
-            onChange={(e) => {
-              const found = project.moments.find((m) => m.id === e.target.value);
-              if (found) onSelectMoment(found);
-            }}
-            className="bg-[#0E1016] border border-[#232834] rounded-lg px-3 py-1.5 text-xs font-medium text-[#F4F5F7] outline-none max-w-md"
-          >
-            {project.moments.map((m, i) => (
-              <option key={m.id} value={m.id}>
-                #{i + 1} · {formatTimecode(m.startSec)}–{formatTimecode(m.endSec)} · {m.title}
-              </option>
-            ))}
-          </select>
+    <div className="space-y-5">
+      {/* Segment Library */}
+      <section className="bg-[#13161D] border border-[#232834] rounded-xl p-4 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <h2 className="font-display text-sm font-semibold text-[#F4F5F7]">
+              Segment Library ({project.segments.length})
+            </h2>
+            <span className="text-xs text-[#94A3B8]">
+              {readySegments.length}/{project.segments.length} downloaded · {completedCount} rendered
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <button
+              type="button"
+              onClick={() =>
+                setSelectedSegmentIds(
+                  selectedSegmentIds.length === readySegments.length
+                    ? []
+                    : readySegments.map((s) => s.id)
+                )
+              }
+              className="px-2.5 py-1.5 bg-[#0E1016] hover:bg-[#1B202C] border border-[#232834] rounded-md text-[#CBD5E1] cursor-pointer"
+            >
+              {selectedSegmentIds.length === readySegments.length && readySegments.length > 0
+                ? 'Clear Selection'
+                : 'Select All Ready'}
+            </button>
+            <button
+              type="button"
+              disabled={!draftBox || selectedSegmentIds.length === 0}
+              onClick={() => handleApplyFacecamBulk('selected')}
+              className="px-2.5 py-1.5 bg-[#0E1016] hover:bg-[#1B202C] border border-[#232834] rounded-md text-[#CBD5E1] cursor-pointer disabled:opacity-40"
+            >
+              Apply Facecam to Selected
+            </button>
+            <button
+              type="button"
+              disabled={!draftBox}
+              onClick={() => handleApplyFacecamBulk('all')}
+              className="px-2.5 py-1.5 bg-[#0E1016] hover:bg-[#1B202C] border border-[#232834] rounded-md text-[#CBD5E1] cursor-pointer disabled:opacity-40"
+            >
+              Apply Facecam to All
+            </button>
+            <button
+              type="button"
+              disabled={selectedSegmentIds.length === 0}
+              onClick={() => handleApplyLayoutBulk('selected')}
+              className="px-2.5 py-1.5 bg-[#0E1016] hover:bg-[#1B202C] border border-[#232834] rounded-md text-[#CBD5E1] cursor-pointer disabled:opacity-40"
+            >
+              Apply Layout to Selected
+            </button>
+            <button
+              type="button"
+              onClick={() => handleApplyLayoutBulk('all')}
+              className="px-2.5 py-1.5 bg-[#0E1016] hover:bg-[#1B202C] border border-[#232834] rounded-md text-[#CBD5E1] cursor-pointer"
+            >
+              Apply Layout to All
+            </button>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2 text-xs text-emerald-400 font-medium">
-          <ShieldCheck className="w-4 h-4 shrink-0" />
-          <span>Clean Audio · YouTube Auto-Captions Mode</span>
-        </div>
-      </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5 max-h-[260px] overflow-y-auto pr-1">
+          {project.segments.map((seg) => {
+            const isActive = activeSegment?.id === seg.id;
+            const isSelected = selectedSegmentIds.includes(seg.id);
+            const effLayout = seg.hasCustomLayout ? seg.layoutId : project.sharedLayoutId;
+            const effCam = seg.hasCustomFacecam
+              ? seg.facecamBox
+              : (seg.facecamBox ?? project.sharedFacecamBox);
 
-      {localDeleted && (
-        <div className="px-4 py-3 text-xs text-amber-200 bg-amber-950/40 border border-amber-700/60 rounded-xl">
-          This local file was pruned from <span className="font-mono">workspace/sources</span>. Re-upload to render additional clips.
-        </div>
-      )}
+            return (
+              <div
+                key={seg.id}
+                onClick={() => setActiveSegmentId(seg.id)}
+                className={`p-3 rounded-lg border transition-colors cursor-pointer flex items-start gap-2.5 ${
+                  isActive
+                    ? 'bg-[#191E29] border-rose-500'
+                    : 'bg-[#0E1016] border-[#232834] hover:border-[#343C4E]'
+                }`}
+              >
+                <button
+                  type="button"
+                  aria-label={`Select segment ${seg.order}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (seg.downloadStatus === 'ready') toggleSelectSegment(seg.id);
+                  }}
+                  disabled={seg.downloadStatus !== 'ready'}
+                  className="mt-0.5 text-[#94A3B8] hover:text-white disabled:opacity-30 cursor-pointer shrink-0"
+                >
+                  {isSelected ? (
+                    <CheckSquare className="w-4 h-4 text-rose-500" />
+                  ) : (
+                    <Square className="w-4 h-4" />
+                  )}
+                </button>
 
-      <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-        {/* Column 1: Source Frame + Facecam Drag Box */}
+                <div className="min-w-0 flex-1 space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-[#F4F5F7] truncate">
+                      #{seg.order} · {seg.title}
+                    </span>
+                    <span className="text-[11px] font-mono tabular-nums text-[#94A3B8] shrink-0">
+                      {seg.durationSeconds}s
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] font-mono text-[#64748B]">
+                    <span>
+                      {formatSecondsToTimecode(seg.startSeconds)}–
+                      {formatSecondsToTimecode(seg.endSeconds)}
+                    </span>
+                    <span>·</span>
+                    <span>{formatBytes(seg.sourceSizeBytes)}</span>
+                    <span>·</span>
+                    <span className="text-[#94A3B8]">
+                      {LAYOUT_OPTIONS.find((l) => l.id === effLayout)?.shortLabel || effLayout}
+                    </span>
+                    {effCam ? (
+                      <span className="text-emerald-400">· Cam Set</span>
+                    ) : effLayout !== 'center-crop-focus' ? (
+                      <span className="text-amber-400">· Needs Cam</span>
+                    ) : null}
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2 pt-0.5">
+                    <div className="flex items-center gap-1.5 text-[11px]">
+                      {seg.downloadStatus === 'ready' && (
+                        <span className="text-emerald-400 font-medium">Downloaded</span>
+                      )}
+                      {seg.downloadStatus === 'downloading' && (
+                        <span className="text-sky-400 font-mono">
+                          Downloading {seg.downloadProgress}%
+                        </span>
+                      )}
+                      {(seg.downloadStatus === 'error' ||
+                        seg.downloadStatus === 'interrupted' ||
+                        seg.downloadStatus === 'pending') && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleRetrySegmentDownload(seg.id);
+                          }}
+                          className="inline-flex items-center gap-1 text-amber-300 hover:text-amber-200 underline cursor-pointer"
+                        >
+                          <RefreshCw className="w-3 h-3" />
+                          {seg.downloadStatus === 'pending' ? 'Download' : 'Retry Download'}
+                        </button>
+                      )}
+
+                      {seg.renderStatus === 'queued' && (
+                        <span className="text-[#94A3B8]">· Queued</span>
+                      )}
+                      {seg.renderStatus === 'rendering' && (
+                        <span className="text-rose-400 font-mono">
+                          · Rendering {seg.renderProgress}%
+                        </span>
+                      )}
+                      {seg.renderStatus === 'completed' && (
+                        <span className="text-emerald-400 font-medium">· Rendered</span>
+                      )}
+                      {(seg.renderStatus === 'failed' || seg.renderStatus === 'interrupted') && (
+                        <span
+                          title={seg.renderError}
+                          className="text-rose-400 font-medium"
+                        >
+                          · {seg.renderStatus === 'interrupted' ? 'Interrupted' : 'Failed'}
+                        </span>
+                      )}
+                    </div>
+
+                    {seg.downloadStatus === 'ready' && seg.sourceFileName && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSourcePreviewSeg(seg);
+                        }}
+                        className="inline-flex items-center gap-1 text-[11px] text-[#94A3B8] hover:text-white cursor-pointer"
+                      >
+                        <Play className="w-3 h-3" />
+                        Source
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* Main 3-Panel Manual Workspace (Matching Reference Screenshot Layout) */}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 items-start">
+        {/* Panel 1: Source Facecam Region */}
         <section className="xl:col-span-4 bg-[#13161D] border border-[#232834] rounded-xl p-5 space-y-4">
-          <div className="flex items-center justify-between gap-2">
+          <div className="flex items-start justify-between gap-2">
             <div>
               <h3 className="font-display text-sm font-semibold text-[#F4F5F7]">
                 1. Source Facecam Region
               </h3>
-              <p className="text-xs text-[#94A3B8]">
-                Drag box on frame or pick a detected corner.
+              <p className="text-xs text-[#94A3B8] mt-0.5">
+                Draw a box on the frame, drag to move, or drag handles to resize.
               </p>
             </div>
             <button
               type="button"
-              onClick={handleSaveFacecam}
-              disabled={isSavingCam}
-              className="px-2.5 py-1 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-md text-[#F4F5F7] cursor-pointer whitespace-nowrap"
+              onClick={handleSaveFacecamSegment}
+              disabled={!activeSegment}
+              className="px-2.5 py-1.5 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-md text-[#F4F5F7] cursor-pointer whitespace-nowrap shrink-0"
             >
-              {savedNotice || (isSavingCam ? 'Saving...' : 'Save Box')}
+              {savingNotice === 'Saved to segment' ? 'Saved' : 'Save Box'}
             </button>
           </div>
 
           <div
-            ref={containerRef}
-            className="relative aspect-video bg-[#080A0D] rounded-lg overflow-hidden border border-[#232834] select-none"
+            ref={frameContainerRef}
+            onMouseDown={handleDrawNewBoxMouseDown}
+            className="relative aspect-video bg-[#080A0D] rounded-lg overflow-hidden border border-[#232834] select-none cursor-crosshair"
           >
             {activeFrameUrl ? (
               <img
+                ref={sourceImgRef}
                 src={activeFrameUrl}
-                alt="Source video frame"
+                alt="Selected segment frame"
                 draggable={false}
-                className="w-full h-full object-cover"
+                className="w-full h-full object-fill"
               />
             ) : (
-              <div className="w-full h-full flex items-center justify-center text-xs text-[#64748B]">
-                No frame preview
+              <div className="w-full h-full flex flex-col items-center justify-center text-xs text-[#64748B] px-4 text-center gap-1.5">
+                <Camera className="w-5 h-5" />
+                <span>
+                  {activeSegment?.downloadStatus === 'downloading'
+                    ? `Downloading segment (${activeSegment.downloadProgress}%)...`
+                    : 'Download segment to extract source frame.'}
+                </span>
               </div>
             )}
 
-            <div
-              onMouseDown={handleFrameMouseDown}
-              style={{
-                left: `${facecamBox.x * 100}%`,
-                top: `${facecamBox.y * 100}%`,
-                width: `${facecamBox.width * 100}%`,
-                height: `${facecamBox.height * 100}%`,
-              }}
-              className="absolute border-2 border-rose-500 bg-rose-500/20 cursor-move rounded-[3px] flex items-start justify-between p-1"
-            >
-              <span className="bg-rose-600 text-white text-[10px] font-mono px-1.5 py-0.5 rounded-[2px]">
-                FACECAM
-              </span>
-            </div>
+            {draftBox && (
+              <div
+                onMouseDown={handleMoveBoxMouseDown}
+                style={{
+                  left: `${draftBox.x * 100}%`,
+                  top: `${draftBox.y * 100}%`,
+                  width: `${draftBox.width * 100}%`,
+                  height: `${draftBox.height * 100}%`,
+                }}
+                className="absolute border-2 border-rose-500 bg-rose-500/20 cursor-move"
+              >
+                <span className="inline-block bg-rose-600 text-white text-[10px] font-mono px-1.5 py-0.5 rounded-br-[2px]">
+                  FACECAM
+                </span>
+
+                {/* 8 Resize Handles */}
+                <div
+                  onMouseDown={(e) => handleResizeMouseDown('nw', e)}
+                  className="absolute -top-1.5 -left-1.5 w-3 h-3 bg-white border border-rose-600 rounded-[2px] cursor-nwse-resize"
+                />
+                <div
+                  onMouseDown={(e) => handleResizeMouseDown('n', e)}
+                  className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-2.5 bg-white border border-rose-600 rounded-[2px] cursor-ns-resize"
+                />
+                <div
+                  onMouseDown={(e) => handleResizeMouseDown('ne', e)}
+                  className="absolute -top-1.5 -right-1.5 w-3 h-3 bg-white border border-rose-600 rounded-[2px] cursor-nesw-resize"
+                />
+                <div
+                  onMouseDown={(e) => handleResizeMouseDown('e', e)}
+                  className="absolute top-1/2 -translate-y-1/2 -right-1.5 w-2.5 h-3 bg-white border border-rose-600 rounded-[2px] cursor-ew-resize"
+                />
+                <div
+                  onMouseDown={(e) => handleResizeMouseDown('se', e)}
+                  className="absolute -bottom-1.5 -right-1.5 w-3 h-3 bg-white border border-rose-600 rounded-[2px] cursor-nwse-resize"
+                />
+                <div
+                  onMouseDown={(e) => handleResizeMouseDown('s', e)}
+                  className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-2.5 bg-white border border-rose-600 rounded-[2px] cursor-ns-resize"
+                />
+                <div
+                  onMouseDown={(e) => handleResizeMouseDown('sw', e)}
+                  className="absolute -bottom-1.5 -left-1.5 w-3 h-3 bg-white border border-rose-600 rounded-[2px] cursor-nesw-resize"
+                />
+                <div
+                  onMouseDown={(e) => handleResizeMouseDown('w', e)}
+                  className="absolute top-1/2 -translate-y-1/2 -left-1.5 w-2.5 h-3 bg-white border border-rose-600 rounded-[2px] cursor-ew-resize"
+                />
+              </div>
+            )}
           </div>
 
-          {project.previewFrames.length > 1 && (
-            <div className="flex items-center gap-2">
-              {project.previewFrames.map((url, idx) => (
+          {/* Frame Time Scrub & Quick Box Reset */}
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[#64748B]">Frame:</span>
+              {[0.15, 0.5, 0.85].map((frac) => (
                 <button
-                  key={url}
+                  key={frac}
                   type="button"
-                  onClick={() => setFrameIndex(idx)}
-                  className={`flex-1 h-10 rounded overflow-hidden border transition-colors cursor-pointer ${
-                    frameIndex === idx ? 'border-rose-500' : 'border-[#232834] opacity-65 hover:opacity-100'
+                  disabled={!activeSegment || activeSegment.downloadStatus !== 'ready'}
+                  onClick={() => handleScrubFrame(frac)}
+                  className={`px-2 py-1 rounded border text-[11px] font-mono cursor-pointer disabled:opacity-40 ${
+                    Math.abs(frameFraction - frac) < 0.05
+                      ? 'bg-[#1C212C] border-rose-500 text-white'
+                      : 'bg-[#0E1016] border-[#232834] text-[#94A3B8] hover:text-white'
                   }`}
                 >
-                  <img src={url} alt={`Keyframe ${idx + 1}`} className="w-full h-full object-cover" />
+                  {Math.round(frac * 100)}%
                 </button>
               ))}
             </div>
-          )}
 
-          <div className="space-y-2">
-            <span className="text-xs font-medium text-[#CBD5E1]">Detected Corners</span>
-            <div className="grid grid-cols-2 gap-2">
-              {project.facecamCandidates.map((cand) => {
-                const isActive =
-                  Math.abs(cand.x - facecamBox.x) < 0.03 &&
-                  Math.abs(cand.y - facecamBox.y) < 0.03;
-                return (
-                  <button
-                    key={cand.presetLabel}
-                    type="button"
-                    onClick={() => setFacecamBox(cand)}
-                    className={`px-2.5 py-2 text-left rounded-lg border text-xs transition-colors cursor-pointer ${
-                      isActive
-                        ? 'bg-rose-950/40 border-rose-500 text-[#F4F5F7]'
-                        : 'bg-[#0E1016] border-[#232834] text-[#94A3B8] hover:text-[#F4F5F7]'
-                    }`}
-                  >
-                    <div className="font-medium truncate">{cand.presetLabel}</div>
-                    <div className="font-mono tabular-nums text-[11px] text-[#64748B]">
-                      Score {(cand.confidence * 100).toFixed(0)}%
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
+            {draftBox ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setDraftBox(null);
+                  setPreviewVideoUrl(null);
+                }}
+                className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-[#94A3B8] hover:text-rose-300 border border-[#232834] rounded cursor-pointer"
+              >
+                <RotateCcw className="w-3 h-3" />
+                Clear Box
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() =>
+                  setDraftBox({ x: 0.72, y: 0.65, width: 0.24, height: 0.28 })
+                }
+                className="px-2 py-1 text-[11px] text-rose-300 hover:text-rose-200 border border-rose-800/60 bg-rose-950/30 rounded cursor-pointer"
+              >
+                + Add Box
+              </button>
+            )}
           </div>
 
+          {/* Coordinate & Pixel Readout */}
+          {draftBox ? (
+            <div className="bg-[#0E1016] border border-[#232834] rounded-lg px-3 py-2 text-[11px] font-mono tabular-nums text-[#94A3B8] flex flex-wrap items-center justify-between gap-2">
+              <span>
+                Norm: x={Math.round(draftBox.x * 100)}% y={Math.round(draftBox.y * 100)}% w=
+                {Math.round(draftBox.width * 100)}% h={Math.round(draftBox.height * 100)}%
+              </span>
+              <span className="text-[#CBD5E1]">
+                {Math.round(draftBox.x * srcWidth)},{Math.round(draftBox.y * srcHeight)} ·{' '}
+                {Math.round(draftBox.width * srcWidth)}×{Math.round(draftBox.height * srcHeight)}px
+              </span>
+            </div>
+          ) : (
+            <div className="bg-[#0E1016] border border-[#232834] rounded-lg px-3 py-2 text-xs text-[#94A3B8]">
+              No facecam box set. Click or drag on the frame above to mark your facecam, or use Center Crop.
+            </div>
+          )}
+
+          {/* Manual Width / Height Sliders */}
           <div className="grid grid-cols-2 gap-3 pt-2 border-t border-[#232834] text-xs">
             <label className="space-y-1">
               <span className="text-[#94A3B8] flex justify-between font-mono tabular-nums">
                 <span>Cam Width</span>
-                <span>{Math.round(facecamBox.width * 100)}%</span>
+                <span>{draftBox ? `${Math.round(draftBox.width * 100)}%` : '—'}</span>
               </span>
               <input
                 type="range"
-                min={12}
-                max={55}
-                value={Math.round(facecamBox.width * 100)}
+                min={5}
+                max={80}
+                disabled={!draftBox}
+                value={draftBox ? Math.round(draftBox.width * 100) : 24}
                 onChange={(e) => {
                   const w = Number(e.target.value) / 100;
-                  setFacecamBox((p) => ({ ...p, width: w, x: Math.min(p.x, 1 - w) }));
+                  setDraftBox((p) => (p ? clampBox({ ...p, width: w }) : null));
                 }}
-                className="w-full accent-rose-500"
+                className="w-full accent-rose-500 disabled:opacity-40"
               />
             </label>
             <label className="space-y-1">
               <span className="text-[#94A3B8] flex justify-between font-mono tabular-nums">
                 <span>Cam Height</span>
-                <span>{Math.round(facecamBox.height * 100)}%</span>
+                <span>{draftBox ? `${Math.round(draftBox.height * 100)}%` : '—'}</span>
               </span>
               <input
                 type="range"
-                min={14}
-                max={60}
-                value={Math.round(facecamBox.height * 100)}
+                min={5}
+                max={80}
+                disabled={!draftBox}
+                value={draftBox ? Math.round(draftBox.height * 100) : 28}
                 onChange={(e) => {
                   const h = Number(e.target.value) / 100;
-                  setFacecamBox((p) => ({ ...p, height: h, y: Math.min(p.y, 1 - h) }));
+                  setDraftBox((p) => (p ? clampBox({ ...p, height: h }) : null));
                 }}
-                className="w-full accent-rose-500"
+                className="w-full accent-rose-500 disabled:opacity-40"
               />
             </label>
           </div>
         </section>
 
-        {/* Column 2: Live 9:16 Preview */}
+        {/* Panel 2: Live 9:16 Preview (Real FFmpeg Composite) */}
         <section className="xl:col-span-3 bg-[#13161D] border border-[#232834] rounded-xl p-5 flex flex-col items-center space-y-3">
-          <div className="w-full flex items-center justify-between">
+          <div className="w-full flex items-center justify-between gap-2">
             <h3 className="font-display text-sm font-semibold text-[#F4F5F7]">
               2. Live 9:16 Preview
             </h3>
@@ -453,151 +1174,99 @@ export function FacecamLayoutStudio({
 
           <div
             style={{ backgroundColor: branding.backgroundHex }}
-            className="w-[234px] h-[416px] rounded-xl overflow-hidden border border-[#2E3545] relative shrink-0 select-none"
+            className="w-[243px] h-[432px] rounded-xl overflow-hidden border border-[#2E3545] relative shrink-0 select-none flex items-center justify-center"
           >
-            {(layoutId === 'split-top-cam' || layoutId === 'split-50-50') && (
-              <div className="w-full h-full flex flex-col">
-                <div
-                  style={camBgStyle}
-                  className={`${layoutId === 'split-50-50' ? 'h-1/2' : 'h-[35%]'} w-full bg-no-repeat border-b border-black/50`}
-                />
-                <div
-                  style={{ backgroundImage: `url(${activeFrameUrl})` }}
-                  className="flex-1 w-full bg-cover bg-center"
-                />
-              </div>
-            )}
-
-            {layoutId === 'split-bottom-cam' && (
-              <div className="w-full h-full flex flex-col">
-                <div
-                  style={{ backgroundImage: `url(${activeFrameUrl})` }}
-                  className="h-[65%] w-full bg-cover bg-center border-b border-black/50"
-                />
-                <div style={camBgStyle} className="flex-1 w-full bg-no-repeat" />
-              </div>
-            )}
-
-            {(layoutId === 'pip-top-left' ||
-              layoutId === 'pip-top-right' ||
-              layoutId === 'pip-bottom-left' ||
-              layoutId === 'pip-bottom-right') && (
-              <div className="w-full h-full relative">
-                <div
-                  style={{ backgroundImage: `url(${activeFrameUrl})` }}
-                  className="w-full h-full bg-cover bg-center"
-                />
-                <div
-                  style={camBgStyle}
-                  className={`absolute w-[74px] h-[74px] rounded-md border-2 border-white/85 bg-no-repeat ${
-                    layoutId === 'pip-top-left'
-                      ? 'top-10 left-3'
-                      : layoutId === 'pip-top-right'
-                        ? 'top-10 right-3'
-                        : layoutId === 'pip-bottom-left'
-                          ? 'bottom-12 left-3'
-                          : 'bottom-12 right-3'
-                  }`}
-                />
-              </div>
-            )}
-
-            {(layoutId === 'blurred-bg-cam-top' || layoutId === 'blurred-bg-cam-bottom') && (
-              <div className="w-full h-full relative flex flex-col items-center justify-center">
-                <div
-                  style={{ backgroundImage: `url(${activeFrameUrl})` }}
-                  className="absolute inset-0 bg-cover bg-center blur-md opacity-45 scale-110"
-                />
-                {layoutId === 'blurred-bg-cam-top' && (
-                  <div
-                    style={camBgStyle}
-                    className="relative z-10 w-[92px] h-[74px] rounded-md border border-white/80 mb-3 bg-no-repeat"
-                  />
-                )}
-                <img
-                  src={activeFrameUrl}
-                  alt="Centered 16:9 stream"
-                  className="relative z-10 w-full aspect-video object-cover border-y border-white/15"
-                />
-                {layoutId === 'blurred-bg-cam-bottom' && (
-                  <div
-                    style={camBgStyle}
-                    className="relative z-10 w-[92px] h-[74px] rounded-md border border-white/80 mt-3 bg-no-repeat"
-                  />
-                )}
-              </div>
-            )}
-
-            {layoutId === 'center-crop-focus' && (
-              <div
-                style={{ backgroundImage: `url(${activeFrameUrl})` }}
-                className="w-full h-full bg-cover bg-center"
+            {previewVideoUrl ? (
+              <video
+                src={previewVideoUrl}
+                controls
+                autoPlay
+                playsInline
+                className="w-full h-full object-contain bg-black"
               />
-            )}
-
-            {layoutId === 'facecam-only-zoom' && (
-              <div style={camBgStyle} className="w-full h-full bg-no-repeat" />
-            )}
-
-            {templateId === 'x-post' && (
-              <div className="absolute top-3 left-3 right-3 z-20 bg-[#0F1117]/95 border border-[#2A303E] rounded-md px-2.5 py-2">
-                <p className="text-[9px] text-[#94A3B8]">{branding.creditText || '@creator'}</p>
-                <p className="text-[10px] font-semibold text-white leading-tight mt-0.5 line-clamp-2">
-                  {clipHook || activeMoment.hookTagline}
-                </p>
-              </div>
-            )}
-            {templateId === 'tiktok-hook' && (
-              <div className="absolute top-4 left-4 right-4 z-20 bg-white text-[#0B0D11] rounded px-2.5 py-1.5 text-center">
-                <p className="text-[10px] font-bold leading-tight line-clamp-2">
-                  {clipHook || activeMoment.hookTagline}
-                </p>
-              </div>
-            )}
-            {templateId === 'breaking-news' && (
-              <div className="absolute bottom-4 left-0 right-0 z-20">
-                <div className="bg-rose-600 text-white text-[9px] font-bold px-2.5 py-0.5">
-                  LIVE CLIP
-                </div>
-                <div className="bg-[#0B0D11]/95 text-white text-[10px] font-semibold px-2.5 py-1.5 line-clamp-1">
-                  {clipHook || activeMoment.hookTagline}
-                </div>
+            ) : isDraggingBox ? (
+              <canvas
+                ref={dragCanvasRef}
+                width={270}
+                height={480}
+                className="w-full h-full object-contain"
+              />
+            ) : previewImgUrl ? (
+              <img
+                src={previewImgUrl}
+                alt="Live FFmpeg 9:16 preview"
+                className="w-full h-full object-contain"
+              />
+            ) : (
+              <div className="p-4 text-center text-xs text-[#94A3B8] space-y-2">
+                {previewImgError ? (
+                  <p className="text-amber-300 leading-relaxed">{previewImgError}</p>
+                ) : (
+                  <p>Select a downloaded segment to render its live 9:16 FFmpeg preview.</p>
+                )}
               </div>
             )}
 
-            {(branding.watermarkText || branding.creditText) && (
-              <span className="absolute bottom-1.5 right-2 z-20 text-[9px] font-medium text-white/75">
-                {branding.watermarkText || branding.creditText}
+            {previewImgLoading && !isDraggingBox && !previewVideoUrl && (
+              <span className="absolute top-2 right-2 px-1.5 py-0.5 rounded bg-black/70 text-[10px] font-mono text-[#CBD5E1]">
+                Updating...
               </span>
             )}
           </div>
 
-          <p className="text-[11px] text-[#94A3B8] text-center">
+          <p className="text-[11px] text-[#94A3B8] text-center leading-relaxed">
             {selectedLayoutMeta.description}
           </p>
+
+          <div className="w-full flex items-center gap-2 pt-1">
+            {previewVideoUrl ? (
+              <button
+                type="button"
+                onClick={() => setPreviewVideoUrl(null)}
+                className="w-full py-1.5 px-3 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-lg text-[#F4F5F7] cursor-pointer"
+              >
+                Back to Frame Preview
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={!activeSegment || activeSegment.downloadStatus !== 'ready' || previewVideoLoading}
+                onClick={handleGenerateVideoPreview}
+                className="w-full py-1.5 px-3 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-lg text-[#F4F5F7] inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-45"
+              >
+                <Video className="w-3.5 h-3.5 text-rose-400" />
+                {previewVideoLoading ? 'Rendering Preview Video...' : 'Play 9:16 Video Preview'}
+              </button>
+            )}
+          </div>
         </section>
 
-        {/* Column 3: 11 Layouts + Template + Render */}
+        {/* Panel 3: Vertical Layout & Render */}
         <section className="xl:col-span-5 bg-[#13161D] border border-[#232834] rounded-xl p-5 space-y-5">
-          <div>
-            <h3 className="font-display text-sm font-semibold text-[#F4F5F7]">
-              3. Vertical Layout & Render
-            </h3>
-            <p className="text-xs text-[#94A3B8] mt-0.5">
-              {project.sourceMode === 'segments'
-                ? 'Automatically fetches only the needed 1080p segment(s) before rendering 9:16 Shorts.'
-                : 'Renders 720×1280 MP4 directly from your local source file.'}
-            </p>
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h3 className="font-display text-sm font-semibold text-[#F4F5F7]">
+                3. Vertical Layout & Render
+              </h3>
+              <p className="text-xs text-[#94A3B8] mt-0.5">
+                Choose a vertical layout and render your downloaded segments into 9:16 Shorts.
+              </p>
+            </div>
+            {savingNotice && (
+              <span className="text-[11px] font-medium text-emerald-400 whitespace-nowrap">
+                {savingNotice}
+              </span>
+            )}
           </div>
 
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
             {LAYOUT_OPTIONS.map((opt) => {
-              const active = layoutId === opt.id;
+              const active = draftLayoutId === opt.id;
               return (
                 <button
                   key={opt.id}
                   type="button"
-                  onClick={() => setLayoutId(opt.id)}
+                  onClick={() => handleSelectLayout(opt.id)}
                   className={`flex items-center gap-2.5 p-2 rounded-lg border text-left transition-colors cursor-pointer ${
                     active
                       ? 'bg-rose-950/40 border-rose-500 text-[#F4F5F7]'
@@ -616,6 +1285,7 @@ export function FacecamLayoutStudio({
             })}
           </div>
 
+          {/* Optional Header Overlay */}
           <div className="pt-4 border-t border-[#232834] space-y-3">
             <div className="flex items-center gap-2 text-xs font-medium text-[#CBD5E1]">
               <Layers className="w-3.5 h-3.5 text-rose-400" />
@@ -626,7 +1296,10 @@ export function FacecamLayoutStudio({
                 <button
                   key={t.id}
                   type="button"
-                  onClick={() => setTemplateId(t.id)}
+                  onClick={() => {
+                    setTemplateId(t.id);
+                    persistProjectSettings({ templateId: t.id });
+                  }}
                   className={`px-2.5 py-2 rounded-lg border text-left transition-colors cursor-pointer ${
                     templateId === t.id
                       ? 'bg-[#1D2330] border-rose-500 text-[#F4F5F7]'
@@ -639,6 +1312,7 @@ export function FacecamLayoutStudio({
               ))}
             </div>
 
+            {/* Branding + Output Settings */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
               <label className="space-y-1 text-xs">
                 <span className="text-[#94A3B8]">Credit Handle</span>
@@ -646,6 +1320,7 @@ export function FacecamLayoutStudio({
                   type="text"
                   value={branding.creditText}
                   onChange={(e) => setBranding((b) => ({ ...b, creditText: e.target.value }))}
+                  onBlur={() => persistProjectSettings({ branding })}
                   className="w-full px-2.5 py-1.5 bg-[#0E1016] border border-[#232834] rounded-md text-[#F4F5F7] outline-none"
                 />
               </label>
@@ -655,6 +1330,7 @@ export function FacecamLayoutStudio({
                   type="text"
                   value={branding.watermarkText}
                   onChange={(e) => setBranding((b) => ({ ...b, watermarkText: e.target.value }))}
+                  onBlur={() => persistProjectSettings({ branding })}
                   placeholder="Optional tag"
                   className="w-full px-2.5 py-1.5 bg-[#0E1016] border border-[#232834] rounded-md text-[#F4F5F7] outline-none"
                 />
@@ -665,7 +1341,11 @@ export function FacecamLayoutStudio({
                   <input
                     type="color"
                     value={branding.backgroundHex}
-                    onChange={(e) => setBranding((b) => ({ ...b, backgroundHex: e.target.value }))}
+                    onChange={(e) => {
+                      const next = { ...branding, backgroundHex: e.target.value };
+                      setBranding(next);
+                      persistProjectSettings({ branding: next });
+                    }}
                     className="h-8 w-10 bg-transparent border border-[#232834] rounded cursor-pointer"
                   />
                   <span className="font-mono text-[11px] text-[#94A3B8]">
@@ -675,13 +1355,50 @@ export function FacecamLayoutStudio({
               </label>
             </div>
 
+            <div className="grid grid-cols-2 gap-2.5">
+              <label className="space-y-1 text-xs">
+                <span className="text-[#94A3B8]">Output Resolution</span>
+                <select
+                  value={resolution}
+                  onChange={(e) => {
+                    const next = e.target.value as '1080x1920' | '720x1280';
+                    setResolution(next);
+                    persistProjectSettings({ resolution: next });
+                  }}
+                  className="w-full px-2.5 py-1.5 bg-[#0E1016] border border-[#232834] rounded-md text-[#F4F5F7] outline-none"
+                >
+                  <option value="1080x1920">1080×1920 (Full HD 9:16)</option>
+                  <option value="720x1280">720×1280 (Fast 9:16)</option>
+                </select>
+              </label>
+              <label className="space-y-1 text-xs">
+                <span className="text-[#94A3B8]">Frame Rate</span>
+                <select
+                  value={frameRate}
+                  onChange={(e) => {
+                    const next = e.target.value as 'original' | '60' | '30';
+                    setFrameRate(next);
+                    persistProjectSettings({ frameRate: next });
+                  }}
+                  className="w-full px-2.5 py-1.5 bg-[#0E1016] border border-[#232834] rounded-md text-[#F4F5F7] outline-none"
+                >
+                  <option value="original">Original FPS</option>
+                  <option value="60">60 FPS</option>
+                  <option value="30">30 FPS</option>
+                </select>
+              </label>
+            </div>
+
             <div className="space-y-2 pt-1">
               <label className="block space-y-1 text-xs">
-                <span className="text-[#94A3B8]">Clip Title & Hook Tagline</span>
+                <span className="text-[#94A3B8]">
+                  Segment #{activeSegment?.order || 1} Clip Title & Hook Tagline
+                </span>
                 <input
                   type="text"
                   value={clipTitle}
                   onChange={(e) => setClipTitle(e.target.value)}
+                  onBlur={handleSaveSegmentMeta}
                   placeholder="Clip title"
                   className="w-full px-2.5 py-1.5 bg-[#0E1016] border border-[#232834] rounded-md text-[#F4F5F7] outline-none"
                 />
@@ -690,64 +1407,94 @@ export function FacecamLayoutStudio({
                 type="text"
                 value={clipHook}
                 onChange={(e) => setClipHook(e.target.value)}
-                placeholder="1-line hook tagline"
+                onBlur={handleSaveSegmentMeta}
+                placeholder="Optional 1-line overlay hook tagline"
                 className="w-full px-2.5 py-1.5 text-xs bg-[#0E1016] border border-[#232834] rounded-md text-[#F4F5F7] outline-none"
               />
             </div>
           </div>
 
-          {renderError && (
-            <div className="px-3 py-2 text-xs text-rose-200 bg-rose-950/50 border border-rose-800/70 rounded-lg">
-              {renderError}
+          {missingFacecamWarnings.length > 0 && (
+            <div className="px-3 py-2.5 text-xs text-amber-200 bg-amber-950/40 border border-amber-700/60 rounded-lg flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
+              <span>
+                {missingFacecamWarnings.length} selected segment(s) use a facecam layout without a saved facecam box. Draw and apply a box in Panel 1, or switch to Center Crop.
+              </span>
+            </div>
+          )}
+
+          {actionError && (
+            <div className="px-3 py-2.5 text-xs text-rose-200 bg-rose-950/50 border border-rose-800/70 rounded-lg">
+              {actionError}
             </div>
           )}
 
           <div className="flex flex-col sm:flex-row gap-2.5">
             <button
               type="button"
-              onClick={handleRenderClip}
-              disabled={isRendering || localDeleted}
-              className="flex-1 py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white text-sm font-semibold rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              onClick={() => handleStartRender('selected')}
+              disabled={submittingRender || anyRendering || selectedSegmentIds.length === 0}
+              className="flex-1 py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white text-sm font-semibold rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-45"
             >
-              {isRendering ? (
-                <>
-                  <Sparkles className="w-4 h-4 animate-spin" />
-                  {renderStage || 'Rendering...'} ({renderProgress}%)
-                </>
-              ) : (
-                <>
-                  <Film className="w-4 h-4" />
-                  Render This Short ({activeMoment.durationSec}s)
-                </>
-              )}
+              <Film className="w-4 h-4" />
+              {anyRendering
+                ? 'Rendering Queue Active...'
+                : `Render Selected (${selectedSegmentIds.length})`}
             </button>
 
-            {batchTargetMoments.length > 1 && (
-              <button
-                type="button"
-                onClick={handleRenderSelectedBatch}
-                disabled={isRendering || localDeleted}
-                className="px-4 py-3 bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] text-[#F4F5F7] text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-50"
-              >
-                <Layers className="w-3.5 h-3.5 text-rose-400" />
-                Render {batchTargetMoments.length} Selected
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => handleStartRender('all')}
+              disabled={submittingRender || anyRendering || readySegments.length === 0}
+              className="px-4 py-3 bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] text-[#F4F5F7] text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-45"
+            >
+              Render All ({readySegments.length})
+            </button>
           </div>
 
-          <div className="flex flex-wrap items-center justify-center gap-3 text-[11px] text-[#94A3B8]">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#94A3B8]">
             <span className="inline-flex items-center gap-1.5">
               <Check className="w-3.5 h-3.5 text-emerald-400" />
-              720×1280 H.264 MP4 · Auto-Captions Mode
+              {resolution} H.264 MP4 · Saved locally in workspace/renders
             </span>
-            {appSettings.autoPruneSourceVod && (
-              <span className="font-mono text-emerald-400">
-                · Auto-Prune Segments ON
-              </span>
+            {completedCount > 0 && (
+              <button
+                type="button"
+                onClick={onGoToMyClips}
+                className="text-rose-400 hover:text-rose-300 font-semibold cursor-pointer"
+              >
+                Open My Clips ({completedCount}) →
+              </button>
             )}
           </div>
         </section>
       </div>
+
+      {/* Source Segment Preview Modal */}
+      {sourcePreviewSeg && sourcePreviewSeg.sourceFileName && (
+        <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+          <div className="bg-[#13161D] border border-[#2E3545] rounded-xl max-w-2xl w-full p-5 space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="font-display text-sm font-semibold text-[#F4F5F7]">
+                #{sourcePreviewSeg.order} · {sourcePreviewSeg.title} ({sourcePreviewSeg.durationSeconds}s)
+              </h3>
+              <button
+                type="button"
+                onClick={() => setSourcePreviewSeg(null)}
+                className="px-2.5 py-1 text-xs bg-[#1C212C] border border-[#32394A] rounded text-[#CBD5E1] cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+            <video
+              src={`/api/sources/${sourcePreviewSeg.sourceFileName}`}
+              controls
+              autoPlay
+              className="w-full aspect-video bg-black rounded-lg border border-[#232834]"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

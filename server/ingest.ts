@@ -4,26 +4,18 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import type {
-  HeatmapPoint,
-  PlatformType,
-  VideoChapter,
-  VideoProject,
-  ViralMoment,
-} from '../src/types.ts';
+import type { PlatformType } from '../src/types.ts';
 import {
+  FRAMES_DIR,
   SOURCES_DIR,
   ensureWorkspace,
   resolveSafeChildPath,
   resolveSafeSourcePath,
-  sanitizeFileSlug,
-  sanitizeFolderName,
 } from './storage.ts';
 import {
   downloadSegmentWithYtDlp,
   ensureYtDlp,
   fetchMetadataWithYtDlp,
-  fetchSubtitlesWithYtDlp,
   resolveStreamUrlsWithYtDlp,
   type ResolvedStreamUrls,
 } from './ytdlp.ts';
@@ -159,7 +151,7 @@ function runCommand(cmd: string, args: string[], timeoutMs = 180000): Promise<{ 
   });
 }
 
-async function probeRemoteMediaUrl(url: string): Promise<{
+export async function probeMediaFile(filePathOrUrl: string): Promise<{
   durationSec: number;
   width: number;
   height: number;
@@ -168,7 +160,7 @@ async function probeRemoteMediaUrl(url: string): Promise<{
 }> {
   const { stdout } = await execFileAsync(
     'ffprobe',
-    ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', url],
+    ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', filePathOrUrl],
     { timeout: 25000 }
   );
   const info = JSON.parse(stdout) as {
@@ -183,7 +175,7 @@ async function probeRemoteMediaUrl(url: string): Promise<{
   const videoStream = info.streams?.find((s) => s.codec_type === 'video');
   const audioStream = info.streams?.find((s) => s.codec_type === 'audio');
   if (!videoStream) {
-    throw new Error('URL does not contain a readable video stream.');
+    throw new Error('URL or file does not contain a readable video stream.');
   }
   let fps = 30;
   if (videoStream.r_frame_rate && videoStream.r_frame_rate.includes('/')) {
@@ -199,45 +191,72 @@ async function probeRemoteMediaUrl(url: string): Promise<{
   };
 }
 
+async function extractDirectThumbnail(mediaUrl: string, durationSec: number): Promise<string | undefined> {
+  try {
+    ensureWorkspace();
+    const frameFile = `inspect_${crypto.randomBytes(5).toString('hex')}.jpg`;
+    const outPath = resolveSafeChildPath(FRAMES_DIR, frameFile);
+    const targetSec = Math.max(0.5, Math.min(durationSec - 0.5, durationSec * 0.25));
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-reconnect',
+        '1',
+        '-reconnect_streamed',
+        '1',
+        '-reconnect_delay_max',
+        '4',
+        '-ss',
+        targetSec.toFixed(2),
+        '-i',
+        mediaUrl,
+        '-vframes',
+        '1',
+        '-q:v',
+        '3',
+        '-vf',
+        'scale=960:-2',
+        outPath,
+      ],
+      { timeout: 15000 }
+    );
+    if (fs.existsSync(outPath) && fs.statSync(outPath).size > 512) {
+      return `/api/frames/${frameFile}`;
+    }
+  } catch {
+    // Non-fatal if direct stream thumbnail cannot be extracted
+  }
+  return undefined;
+}
+
 export interface InspectUrlResult {
   title: string;
   platform: PlatformType;
-  downloadFolder?: string;
+  thumbnailUrl?: string;
   streamUrls?: ResolvedStreamUrls;
-  autoTranscriptText?: string;
-  preProbed?: {
+  preProbed: {
     durationSec: number;
     width: number;
     height: number;
     fps: number;
     hasAudio: boolean;
   };
-  chapters?: VideoChapter[];
-  heatmap?: HeatmapPoint[];
 }
 
 /**
  * Inspects a video/stream link WITHOUT downloading the full video file.
- * Extracts metadata, heatmaps, chapters, remote stream URLs, and subtitles/auto-captions
- * so the AI can pinpoint the best moments first before downloading only those parts in 1080p.
+ * Extracts title, duration, resolution, frame rate, and preview thumbnail.
  */
 export async function inspectFromUrl(
   rawUrl: string,
-  titleOverride?: string,
-  onProgress?: (pct: number, stage: string, detail?: string) => void,
-  options?: {
-    downloadFolder?: string;
-    skipAutoTranscript?: boolean;
-  }
+  titleOverride?: string
 ): Promise<InspectUrlResult> {
   ensureWorkspace();
   const { parsedUrl, platform, isDirectMediaExt } = detectPlatformFromUrl(rawUrl);
   const id = crypto.randomBytes(4).toString('hex');
-  const cleanFolder = sanitizeFolderName(options?.downloadFolder || 'segments') || 'segments';
 
   if (platform === 'direct') {
-    onProgress?.(8, 'Inspecting direct media link...', parsedUrl.hostname);
-
     let contentType = '';
     try {
       const headCtrl = new AbortController();
@@ -262,19 +281,14 @@ export async function inspectFromUrl(
       !contentType.includes('mp4')
     ) {
       try {
-        onProgress?.(12, 'Fetching remote metadata...', parsedUrl.hostname);
         const meta = await fetchMetadataWithYtDlp(parsedUrl.toString(), 'direct');
         const resolvedTitle = titleOverride?.trim() || meta.title;
-        const autoTranscriptText = options?.skipAutoTranscript
-          ? undefined
-          : await fetchSubtitlesWithYtDlp(parsedUrl.toString());
         const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
         return {
           title: resolvedTitle.slice(0, 120),
           platform: 'direct',
-          downloadFolder: cleanFolder,
+          thumbnailUrl: meta.thumbnailUrl,
           streamUrls,
-          autoTranscriptText,
           preProbed: {
             durationSec: meta.durationSec,
             width: meta.width,
@@ -282,8 +296,6 @@ export async function inspectFromUrl(
             fps: meta.fps,
             hasAudio: meta.hasAudio,
           },
-          chapters: meta.chapters,
-          heatmap: meta.heatmap,
         };
       } catch (err) {
         if (err instanceof Error && (err.message.includes('bot verification') || err.message.includes('cookies'))) {
@@ -295,7 +307,7 @@ export async function inspectFromUrl(
       }
     }
 
-    const probed = await probeRemoteMediaUrl(parsedUrl.toString()).catch((err) => {
+    const probed = await probeMediaFile(parsedUrl.toString()).catch((err) => {
       throw new Error(
         err instanceof Error
           ? `Could not read remote media stream: ${err.message}`
@@ -308,16 +320,12 @@ export async function inspectFromUrl(
       path.basename(parsedUrl.pathname, path.extname(parsedUrl.pathname)) ||
       `Direct Stream ${id}`;
 
-    onProgress?.(
-      18,
-      'Remote stream indexed (zero full download)',
-      `${Math.round(probed.durationSec / 60)} min · ${probed.width}x${probed.height}`
-    );
+    const thumbnailUrl = await extractDirectThumbnail(parsedUrl.toString(), probed.durationSec);
 
     return {
       title: derivedTitle.slice(0, 120),
       platform: 'direct',
-      downloadFolder: cleanFolder,
+      thumbnailUrl,
       streamUrls: {
         videoUrl: parsedUrl.toString(),
         audioUrl: parsedUrl.toString(),
@@ -329,33 +337,16 @@ export async function inspectFromUrl(
   }
 
   // Platform link (YouTube / Twitch / Kick)
-  onProgress?.(6, 'Preparing link inspector (yt-dlp)...', platform.toUpperCase());
   await ensureYtDlp();
-
-  onProgress?.(12, `Inspecting ${platform.toUpperCase()} metadata, chapters & heatmaps...`);
   const meta = await fetchMetadataWithYtDlp(parsedUrl.toString(), platform);
   const resolvedTitle = titleOverride?.trim() || meta.title;
-
-  let autoTranscriptText: string | undefined;
-  if (!options?.skipAutoTranscript) {
-    onProgress?.(18, 'Fetching captions & transcript remotely (zero video download)...');
-    autoTranscriptText = await fetchSubtitlesWithYtDlp(parsedUrl.toString()).catch(() => undefined);
-  }
-
   const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
-
-  onProgress?.(
-    24,
-    'Link indexed for AI moment detection',
-    `${(meta.durationSec / 60).toFixed(0)} min · ${meta.width}x${meta.height}`
-  );
 
   return {
     title: resolvedTitle.slice(0, 120),
     platform,
-    downloadFolder: cleanFolder,
+    thumbnailUrl: meta.thumbnailUrl,
     streamUrls,
-    autoTranscriptText,
     preProbed: {
       durationSec: meta.durationSec,
       width: meta.width,
@@ -363,107 +354,181 @@ export async function inspectFromUrl(
       fps: meta.fps,
       hasAudio: meta.hasAudio,
     },
-    chapters: meta.chapters,
-    heatmap: meta.heatmap,
   };
 }
 
 /**
- * Downloads ONLY a single AI-selected moment [startSec..endSec] in up to 1080p MP4
- * into workspace/sources/<folder>/.
+ * Extracts a single frame from a downloaded segment file at a normalized fraction (0..1)
+ * and caches it in workspace/frames/ so Panel 1 can display the real source frame.
  */
-export async function downloadMomentSegment1080p(params: {
-  project: VideoProject;
-  moment: ViralMoment;
-  onProgress?: (pct: number, detail: string) => void;
-}): Promise<{ segmentFileName: string; segmentSizeBytes: number }> {
+export async function extractSegmentFrameAtFraction(params: {
+  projectId: string;
+  segmentId: string;
+  segmentFilePath: string;
+  durationSec: number;
+  fraction?: number;
+}): Promise<string> {
   ensureWorkspace();
-  if (!params.project.sourceUrl) {
-    throw new Error('Project does not have a source URL to download this segment.');
+  const frac = Math.max(0.05, Math.min(0.95, params.fraction ?? 0.5));
+  const fracTag = String(Math.round(frac * 100)).padStart(3, '0');
+  const frameFile = `${params.projectId}_${params.segmentId}_${fracTag}.jpg`;
+  const outPath = resolveSafeChildPath(FRAMES_DIR, frameFile);
+
+  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 1024) {
+    return `/api/frames/${frameFile}`;
   }
 
-  const folder = sanitizeFolderName(params.project.downloadFolder || 'segments') || 'segments';
-  const slug = sanitizeFileSlug(params.project.title, 36);
-  const relativeFileName = `${folder}/${slug}_${params.moment.id}.mp4`;
-  const targetPath = resolveSafeSourcePath(relativeFileName);
+  const targetSec = Math.max(0.1, Math.min(Math.max(0.2, params.durationSec - 0.2), params.durationSec * frac));
 
+  await execFileAsync(
+    'ffmpeg',
+    [
+      '-y',
+      '-ss',
+      targetSec.toFixed(2),
+      '-i',
+      params.segmentFilePath,
+      '-vframes',
+      '1',
+      '-q:v',
+      '2',
+      outPath,
+    ],
+    { timeout: 15000 }
+  );
+
+  if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
+    // Fallback to very first frame if seeking near EOF failed
+    await execFileAsync(
+      'ffmpeg',
+      ['-y', '-i', params.segmentFilePath, '-vframes', '1', '-q:v', '2', outPath],
+      { timeout: 15000 }
+    );
+  }
+
+  return `/api/frames/${frameFile}`;
+}
+
+/**
+ * Downloads ONLY a single timestamp range [startSeconds..endSeconds] into the project's
+ * dedicated workspace/sources/<projectId>/ directory, probes its dimensions, and extracts
+ * a preview frame for Panel 1. Does NOT perform facecam detection or rendering.
+ */
+export async function downloadProjectSegmentFile(params: {
+  projectId: string;
+  segmentId: string;
+  order: number;
+  sourceUrl: string;
+  sourceType: PlatformType;
+  startSeconds: number;
+  endSeconds: number;
+  onProgress?: (pct: number, detail: string) => void;
+}): Promise<{
+  sourceFileName: string;
+  sourceSizeBytes: number;
+  frameUrl: string;
+  width: number;
+  height: number;
+  fps: number;
+  hasAudio: boolean;
+}> {
+  ensureWorkspace();
+  const segNum = String(params.order).padStart(3, '0');
+  const relativeFileName = `${params.projectId}/segment_${segNum}_${params.segmentId}.mp4`;
+  const targetPath = resolveSafeSourcePath(relativeFileName);
   const parentDir = path.dirname(targetPath);
   if (!fs.existsSync(parentDir)) {
     fs.mkdirSync(parentDir, { recursive: true });
   }
 
-  // Return existing segment file immediately if already present on disk
-  if (fs.existsSync(targetPath) && fs.statSync(targetPath).size > 4096) {
-    return {
-      segmentFileName: relativeFileName,
-      segmentSizeBytes: fs.statSync(targetPath).size,
-    };
-  }
+  const duration = Math.max(2, params.endSeconds - params.startSeconds);
 
-  const duration = Math.max(2, Math.min(60, params.moment.endSec - params.moment.startSec));
-
-  if (params.project.sourceType === 'direct') {
-    params.onProgress?.(20, 'Extracting 1080p direct slice via FFmpeg...');
-    await runCommand(
-      'ffmpeg',
-      [
-        '-y',
-        '-reconnect',
-        '1',
-        '-reconnect_streamed',
-        '1',
-        '-reconnect_delay_max',
-        '4',
-        '-ss',
-        params.moment.startSec.toFixed(2),
-        '-t',
-        duration.toFixed(2),
-        '-i',
-        params.project.sourceUrl,
-        '-vf',
-        "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
-        '-c:v',
-        'libx264',
-        '-preset',
-        'veryfast',
-        '-crf',
-        '20',
-        '-pix_fmt',
-        'yuv420p',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '128k',
-        '-movflags',
-        '+faststart',
+  if (!fs.existsSync(targetPath) || fs.statSync(targetPath).size <= 4096) {
+    if (params.sourceType === 'direct') {
+      params.onProgress?.(20, 'Extracting direct video segment via FFmpeg...');
+      await runCommand(
+        'ffmpeg',
+        [
+          '-y',
+          '-reconnect',
+          '1',
+          '-reconnect_streamed',
+          '1',
+          '-reconnect_delay_max',
+          '4',
+          '-ss',
+          params.startSeconds.toFixed(2),
+          '-t',
+          duration.toFixed(2),
+          '-i',
+          params.sourceUrl,
+          '-vf',
+          "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
+          '-c:v',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-crf',
+          '20',
+          '-pix_fmt',
+          'yuv420p',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '160k',
+          '-movflags',
+          '+faststart',
+          targetPath,
+        ],
+        240000
+      );
+    } else {
+      await downloadSegmentWithYtDlp(
+        params.sourceUrl,
+        params.startSeconds,
+        params.endSeconds,
         targetPath,
-      ],
-      180000
-    );
-  } else {
-    await downloadSegmentWithYtDlp(
-      params.project.sourceUrl,
-      params.moment.startSec,
-      params.moment.endSec,
-      targetPath,
-      params.project.sourceType,
-      params.onProgress
-    );
+        params.sourceType,
+        params.onProgress
+      );
+    }
   }
 
-  if (!fs.existsSync(targetPath)) {
-    throw new Error('1080p segment download did not write an MP4 file.');
+  if (!fs.existsSync(targetPath) || fs.statSync(targetPath).size === 0) {
+    throw new Error('Segment download did not produce a valid MP4 file.');
   }
+
+  const stat = fs.statSync(targetPath);
+  const probed = await probeMediaFile(targetPath).catch(() => ({
+    durationSec: duration,
+    width: 1920,
+    height: 1080,
+    fps: 30,
+    hasAudio: true,
+  }));
+
+  const frameUrl = await extractSegmentFrameAtFraction({
+    projectId: params.projectId,
+    segmentId: params.segmentId,
+    segmentFilePath: targetPath,
+    durationSec: probed.durationSec,
+    fraction: 0.5,
+  });
 
   return {
-    segmentFileName: relativeFileName,
-    segmentSizeBytes: fs.statSync(targetPath).size,
+    sourceFileName: relativeFileName,
+    sourceSizeBytes: stat.size,
+    frameUrl,
+    width: probed.width,
+    height: probed.height,
+    fps: probed.fps,
+    hasAudio: probed.hasAudio,
   };
 }
 
 /**
- * Generates a real 18-second 1280x720 MP4 using FFmpeg with animated gameplay motion,
- * a distinct corner facecam overlay box, and multi-peak reaction audio spikes for local testing.
+ * Generates a real 18-second 1280x720 MP4 using FFmpeg with animated gameplay motion
+ * and a corner facecam overlay box for local verification and testing.
  */
 export async function generateSampleStreamVideo(): Promise<{
   fileName: string;

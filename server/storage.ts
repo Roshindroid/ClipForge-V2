@@ -1,13 +1,14 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type {
-  AppSettings,
+  ClipProject,
   RenderedClip,
   StorageStatus,
-  VideoProject,
 } from '../src/types.ts';
 
 export const WORKSPACE_ROOT = path.resolve(process.cwd(), 'workspace');
+export const PROJECTS_DIR = path.join(WORKSPACE_ROOT, 'projects');
 export const SOURCES_DIR = process.env.CLIPFORGE_SOURCES_DIR?.trim()
   ? path.resolve(process.env.CLIPFORGE_SOURCES_DIR.trim())
   : path.join(WORKSPACE_ROOT, 'sources');
@@ -18,14 +19,9 @@ export const RENDERS_DIR = process.env.CLIPFORGE_RENDERS_DIR?.trim()
 
 const PROJECTS_FILE = path.join(WORKSPACE_ROOT, 'projects.json');
 const CLIPS_FILE = path.join(WORKSPACE_ROOT, 'clips.json');
-const SETTINGS_FILE = path.join(WORKSPACE_ROOT, 'settings.json');
-
-export const DEFAULT_SETTINGS: AppSettings = {
-  autoPruneSourceVod: true,
-};
 
 export function ensureWorkspace(): void {
-  for (const dir of [WORKSPACE_ROOT, SOURCES_DIR, FRAMES_DIR, RENDERS_DIR]) {
+  for (const dir of [WORKSPACE_ROOT, PROJECTS_DIR, SOURCES_DIR, FRAMES_DIR, RENDERS_DIR]) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
@@ -35,9 +31,6 @@ export function ensureWorkspace(): void {
   }
   if (!fs.existsSync(CLIPS_FILE)) {
     fs.writeFileSync(CLIPS_FILE, '[]', 'utf8');
-  }
-  if (!fs.existsSync(SETTINGS_FILE)) {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(DEFAULT_SETTINGS, null, 2), 'utf8');
   }
 }
 
@@ -105,9 +98,11 @@ function readJson<T>(filePath: string, fallback: T): T {
   }
 }
 
-function writeJson<T>(filePath: string, data: T): void {
+function writeJsonAtomic<T>(filePath: string, data: T): void {
   ensureWorkspace();
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+  const tmpPath = `${filePath}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(tmpPath, filePath);
 }
 
 function removeEmptySourceSubdir(filePath: string): void {
@@ -128,212 +123,362 @@ function removeEmptySourceSubdir(filePath: string): void {
   }
 }
 
-function syncProjectWithDisk(project: VideoProject): { project: VideoProject; changed: boolean } {
+function syncRenderedClipsWithDisk(rawClips: RenderedClip[]): {
+  clips: RenderedClip[];
+  changed: boolean;
+} {
   let changed = false;
-  let nextProject = project;
+  const verified: RenderedClip[] = [];
 
-  if (project.sourceMode === 'local' && project.fileName) {
+  for (const clip of rawClips) {
+    if (!clip || !clip.outputFileName) {
+      changed = true;
+      continue;
+    }
     try {
-      const srcPath = resolveSafeSourcePath(project.fileName);
-      const exists = fs.existsSync(srcPath);
-      if (!exists && !project.sourceDeleted) {
-        nextProject = { ...nextProject, sourceDeleted: true, sourceSizeBytes: 0 };
+      const outPath = resolveSafeChildPath(RENDERS_DIR, clip.outputFileName);
+      if (!fs.existsSync(outPath)) {
         changed = true;
-      } else if (exists) {
-        const size = fs.statSync(srcPath).size;
-        if (nextProject.sourceDeleted || nextProject.sourceSizeBytes !== size) {
-          nextProject = { ...nextProject, sourceDeleted: false, sourceSizeBytes: size };
-          changed = true;
-        }
+        continue;
       }
+      const size = fs.statSync(outPath).size;
+      if (size < 4096) {
+        changed = true;
+        continue;
+      }
+      const nextClip =
+        clip.fileSizeBytes !== size ? { ...clip, fileSizeBytes: size } : clip;
+      if (nextClip !== clip) changed = true;
+      verified.push(nextClip);
     } catch {
-      // ignore malformed path
+      changed = true;
     }
   }
 
-  let momentsChanged = false;
-  const syncedMoments = nextProject.moments.map((m) => {
-    if (!m.segmentFileName) {
-      return m;
-    }
-    try {
-      const segPath = resolveSafeSourcePath(m.segmentFileName);
-      const exists = fs.existsSync(segPath);
-      if (!exists && m.segmentStatus === 'ready') {
-        momentsChanged = true;
-        return { ...m, segmentStatus: 'pruned' as const, segmentSizeBytes: 0 };
-      }
-      if (exists) {
-        const size = fs.statSync(segPath).size;
-        if (m.segmentStatus !== 'ready' || m.segmentSizeBytes !== size) {
-          momentsChanged = true;
-          return { ...m, segmentStatus: 'ready' as const, segmentSizeBytes: size };
-        }
-      }
-    } catch {
-      // ignore
-    }
-    return m;
-  });
-
-  if (momentsChanged) {
-    nextProject = { ...nextProject, moments: syncedMoments };
-    changed = true;
-  }
-
-  return { project: nextProject, changed };
+  return { clips: verified, changed };
 }
 
-export function listProjects(): VideoProject[] {
-  const raw = readJson<VideoProject[]>(PROJECTS_FILE, []);
-  let anyChanged = false;
-  const synced = raw.map((p) => {
-    const res = syncProjectWithDisk(p);
+function reconcileProjectWithDisk(
+  project: ClipProject,
+  validClipIds: Set<string>,
+  isBootRecovery: boolean
+): { project: ClipProject; changed: boolean } {
+  let changed = false;
+
+  const nextSegments = (project.segments || []).map((seg) => {
+    let updated = seg;
+
+    // Verify downloaded source file on disk
+    if (updated.sourceFileName) {
+      try {
+        const segPath = resolveSafeSourcePath(updated.sourceFileName);
+        if (fs.existsSync(segPath) && fs.statSync(segPath).size > 4096) {
+          const diskSize = fs.statSync(segPath).size;
+          if (updated.downloadStatus !== 'ready' || updated.sourceSizeBytes !== diskSize) {
+            updated = {
+              ...updated,
+              downloadStatus: 'ready',
+              downloadProgress: 100,
+              sourceSizeBytes: diskSize,
+              downloadError: undefined,
+            };
+            changed = true;
+          }
+        } else if (updated.downloadStatus === 'ready') {
+          updated = {
+            ...updated,
+            downloadStatus: 'interrupted',
+            downloadProgress: 0,
+            sourceSizeBytes: 0,
+            downloadError: 'Source segment file not found on disk. Click Retry to re-download.',
+          };
+          changed = true;
+        }
+      } catch {
+        // ignore invalid path
+      }
+    }
+
+    // Handle interrupted downloads on server restart
+    if (isBootRecovery && updated.downloadStatus === 'downloading') {
+      updated = {
+        ...updated,
+        downloadStatus: 'interrupted',
+        downloadProgress: 0,
+        downloadError: 'Download was interrupted when the server closed. Click Retry to resume.',
+      };
+      changed = true;
+    }
+
+    // Verify frame URL still exists on disk if referenced
+    if (updated.frameUrl && updated.frameUrl.startsWith('/api/frames/')) {
+      const frameFile = updated.frameUrl.replace('/api/frames/', '');
+      try {
+        const framePath = resolveSafeChildPath(FRAMES_DIR, frameFile);
+        if (!fs.existsSync(framePath)) {
+          updated = { ...updated, frameUrl: undefined };
+          changed = true;
+        }
+      } catch {
+        updated = { ...updated, frameUrl: undefined };
+        changed = true;
+      }
+    }
+
+    // Handle interrupted renders on server restart
+    if (isBootRecovery && (updated.renderStatus === 'rendering' || updated.renderStatus === 'queued')) {
+      updated = {
+        ...updated,
+        renderStatus: 'interrupted',
+        renderProgress: 0,
+        renderError: 'Render was interrupted when the server closed. Click Render to retry.',
+      };
+      changed = true;
+    }
+
+    // Ensure renderedClipId still maps to a verified clip on disk
+    if (updated.renderedClipId && !validClipIds.has(updated.renderedClipId)) {
+      updated = {
+        ...updated,
+        renderedClipId: undefined,
+        renderStatus: updated.renderStatus === 'completed' ? 'idle' : updated.renderStatus,
+        renderProgress: updated.renderStatus === 'completed' ? 0 : updated.renderProgress,
+      };
+      changed = true;
+    }
+
+    return updated;
+  });
+
+  if (changed) {
+    return {
+      project: { ...project, segments: nextSegments },
+      changed: true,
+    };
+  }
+  return { project, changed: false };
+}
+
+/**
+ * Restores and verifies persistent workspace projects and rendered clips on server startup.
+ * Marks any in-flight downloads/renders from a previous run as interrupted while preserving
+ * all completed clips and downloaded segment files.
+ */
+export function restoreWorkspaceOnBoot(): void {
+  ensureWorkspace();
+  const rawClips = readJson<RenderedClip[]>(CLIPS_FILE, []);
+  const { clips, changed: clipsChanged } = syncRenderedClipsWithDisk(rawClips);
+  if (clipsChanged) {
+    writeJsonAtomic(CLIPS_FILE, clips);
+  }
+
+  const validClipIds = new Set(clips.map((c) => c.id));
+  const rawProjects = readJson<ClipProject[]>(PROJECTS_FILE, []);
+  const validProjects = rawProjects.filter((p) => p && Array.isArray(p.segments));
+  let projectsChanged = validProjects.length !== rawProjects.length;
+
+  const reconciled = validProjects.map((p) => {
+    const res = reconcileProjectWithDisk(p, validClipIds, true);
+    if (res.changed) projectsChanged = true;
+    // Also mirror per-project JSON in workspace/projects/<id>.json for durability
+    try {
+      const perProjPath = resolveSafeChildPath(PROJECTS_DIR, `${res.project.id}.json`);
+      writeJsonAtomic(perProjPath, res.project);
+    } catch {
+      // ignore mirror write issue
+    }
+    return res.project;
+  });
+
+  if (projectsChanged) {
+    writeJsonAtomic(PROJECTS_FILE, reconciled);
+  }
+}
+
+export function listProjects(): ClipProject[] {
+  const rawClips = listClips();
+  const validClipIds = new Set(rawClips.map((c) => c.id));
+  const raw = readJson<ClipProject[]>(PROJECTS_FILE, []);
+  const valid = raw.filter((p) => p && Array.isArray(p.segments));
+  let anyChanged = valid.length !== raw.length;
+
+  const synced = valid.map((p) => {
+    const res = reconcileProjectWithDisk(p, validClipIds, false);
     if (res.changed) anyChanged = true;
     return res.project;
   });
+
   if (anyChanged) {
-    writeJson(PROJECTS_FILE, synced);
+    writeJsonAtomic(PROJECTS_FILE, synced);
   }
   return synced;
 }
 
-export function getProject(projectId: string): VideoProject | undefined {
+export function getProject(projectId: string): ClipProject | undefined {
   return listProjects().find((p) => p.id === projectId);
 }
 
-export function saveProject(project: VideoProject): VideoProject {
-  const all = readJson<VideoProject[]>(PROJECTS_FILE, []);
-  const idx = all.findIndex((p) => p.id === project.id);
+export function saveProject(project: ClipProject): ClipProject {
+  const all = readJson<ClipProject[]>(PROJECTS_FILE, []).filter(
+    (p) => p && Array.isArray(p.segments)
+  );
+  const nextProject: ClipProject = {
+    ...project,
+    updatedAt: new Date().toISOString(),
+  };
+  const idx = all.findIndex((p) => p.id === nextProject.id);
   if (idx >= 0) {
-    all[idx] = project;
+    all[idx] = nextProject;
   } else {
-    all.unshift(project);
+    all.unshift(nextProject);
   }
-  writeJson(PROJECTS_FILE, all);
-  return project;
-}
-
-function cleanupProjectPreviewSlices(projectId: string): number {
-  let freed = 0;
+  writeJsonAtomic(PROJECTS_FILE, all);
   try {
-    if (fs.existsSync(FRAMES_DIR)) {
-      for (const file of fs.readdirSync(FRAMES_DIR)) {
-        if (file.startsWith(`preview_${projectId}_`)) {
-          const full = path.join(FRAMES_DIR, file);
-          freed += fs.statSync(full).size;
-          fs.unlinkSync(full);
-        }
-      }
-    }
+    const perProjPath = resolveSafeChildPath(PROJECTS_DIR, `${nextProject.id}.json`);
+    writeJsonAtomic(perProjPath, nextProject);
   } catch {
-    // ignore cleanup errors
+    // ignore mirror write issue
   }
-  return freed;
+  return nextProject;
 }
 
-export function cleanupProjectSource(projectId: string): {
-  project: VideoProject | null;
-  freedBytes: number;
-} {
-  const target = getProject(projectId);
-  if (!target) return { project: null, freedBytes: 0 };
+export function deleteProject(
+  projectId: string,
+  options?: { deleteClips?: boolean }
+): { deleted: boolean; deletedClipCount: number } {
+  const all = listProjects();
+  const target = all.find((p) => p.id === projectId);
+  if (!target) return { deleted: false, deletedClipCount: 0 };
 
-  let freedBytes = 0;
-  if (target.sourceMode === 'local' && target.fileName) {
-    try {
-      const srcPath = resolveSafeSourcePath(target.fileName);
-      if (fs.existsSync(srcPath)) {
-        freedBytes += fs.statSync(srcPath).size;
-        fs.unlinkSync(srcPath);
-        removeEmptySourceSubdir(srcPath);
-      }
-    } catch {
-      // ignore
-    }
+  const remaining = all.filter((p) => p.id !== projectId);
+  writeJsonAtomic(PROJECTS_FILE, remaining);
+
+  try {
+    const perProjPath = resolveSafeChildPath(PROJECTS_DIR, `${projectId}.json`);
+    if (fs.existsSync(perProjPath)) fs.unlinkSync(perProjPath);
+  } catch {
+    // ignore
   }
 
-  const nextMoments = target.moments.map((m) => {
-    if (m.segmentFileName) {
+  // Delete project's source segments from workspace/sources
+  for (const seg of target.segments) {
+    if (seg.sourceFileName) {
       try {
-        const segPath = resolveSafeSourcePath(m.segmentFileName);
+        const segPath = resolveSafeSourcePath(seg.sourceFileName);
         if (fs.existsSync(segPath)) {
-          freedBytes += fs.statSync(segPath).size;
           fs.unlinkSync(segPath);
           removeEmptySourceSubdir(segPath);
         }
       } catch {
         // ignore
       }
-      return {
-        ...m,
-        segmentStatus: m.segmentStatus === 'ready' ? ('pruned' as const) : m.segmentStatus,
-        segmentSizeBytes: 0,
-      };
     }
-    return m;
-  });
+  }
 
-  freedBytes += cleanupProjectPreviewSlices(projectId);
+  // Also remove project directory in workspace/sources if empty or remaining
+  try {
+    const projSourceDir = resolveSafeSourcePath(projectId);
+    if (fs.existsSync(projSourceDir)) {
+      fs.rmSync(projSourceDir, { recursive: true, force: true });
+    }
+  } catch {
+    // ignore
+  }
 
-  const updated = saveProject({
-    ...target,
-    sourceDeleted: target.sourceMode === 'local' ? true : target.sourceDeleted,
-    sourceSizeBytes: 0,
-    moments: nextMoments,
-  });
-  return { project: updated, freedBytes };
-}
-
-export function pruneAllDownloadedSources(): {
-  projects: VideoProject[];
-  freedBytes: number;
-} {
-  const all = listProjects();
-  let freedBytes = 0;
-  const updatedProjects = all.map((proj) => {
-    if (proj.sourceMode === 'local' && proj.fileName) {
-      try {
-        const srcPath = resolveSafeSourcePath(proj.fileName);
-        if (fs.existsSync(srcPath)) {
-          freedBytes += fs.statSync(srcPath).size;
-          fs.unlinkSync(srcPath);
-          removeEmptySourceSubdir(srcPath);
+  // Delete cached frames for this project
+  try {
+    if (fs.existsSync(FRAMES_DIR)) {
+      for (const file of fs.readdirSync(FRAMES_DIR)) {
+        if (file.startsWith(`${projectId}_`) || file.startsWith(`preview_${projectId}_`)) {
+          fs.unlinkSync(path.join(FRAMES_DIR, file));
         }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  let deletedClipCount = 0;
+  if (options?.deleteClips) {
+    const allClips = listClips();
+    const toDelete = allClips.filter((c) => c.projectId === projectId);
+    const keepClips = allClips.filter((c) => c.projectId !== projectId);
+    for (const c of toDelete) {
+      try {
+        const outPath = resolveSafeChildPath(RENDERS_DIR, c.outputFileName);
+        if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
       } catch {
         // ignore
       }
+      deletedClipCount++;
     }
-    const nextMoments = proj.moments.map((m) => {
-      if (m.segmentFileName) {
-        try {
-          const segPath = resolveSafeSourcePath(m.segmentFileName);
-          if (fs.existsSync(segPath)) {
-            freedBytes += fs.statSync(segPath).size;
-            fs.unlinkSync(segPath);
-            removeEmptySourceSubdir(segPath);
-          }
-        } catch {
-          // ignore
-        }
-        return {
-          ...m,
-          segmentStatus: m.segmentStatus === 'ready' ? ('pruned' as const) : m.segmentStatus,
-          segmentSizeBytes: 0,
-        };
+    writeJsonAtomic(CLIPS_FILE, keepClips);
+  }
+
+  return { deleted: true, deletedClipCount };
+}
+
+export function listClips(): RenderedClip[] {
+  const raw = readJson<RenderedClip[]>(CLIPS_FILE, []);
+  const { clips, changed } = syncRenderedClipsWithDisk(raw);
+  if (changed) {
+    writeJsonAtomic(CLIPS_FILE, clips);
+  }
+  return clips;
+}
+
+export function getClip(clipId: string): RenderedClip | undefined {
+  return listClips().find((c) => c.id === clipId);
+}
+
+export function saveClip(clip: RenderedClip): RenderedClip {
+  const all = listClips();
+  const idx = all.findIndex((c) => c.id === clip.id);
+  if (idx >= 0) {
+    all[idx] = clip;
+  } else {
+    all.unshift(clip);
+  }
+  writeJsonAtomic(CLIPS_FILE, all);
+  return clip;
+}
+
+export function deleteClip(clipId: string): boolean {
+  const all = listClips();
+  const target = all.find((c) => c.id === clipId);
+  if (!target) return false;
+
+  writeJsonAtomic(
+    CLIPS_FILE,
+    all.filter((c) => c.id !== clipId)
+  );
+
+  try {
+    const outPath = resolveSafeChildPath(RENDERS_DIR, target.outputFileName);
+    if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+  } catch {
+    // ignore
+  }
+
+  // Clear renderedClipId reference on any project segment without touching its downloaded source
+  const projects = readJson<ClipProject[]>(PROJECTS_FILE, []);
+  let projUpdated = false;
+  const nextProjects = projects.map((p) => {
+    if (p.id !== target.projectId) return p;
+    const nextSegs = (p.segments || []).map((s) => {
+      if (s.renderedClipId === clipId) {
+        projUpdated = true;
+        return { ...s, renderedClipId: undefined, renderStatus: 'idle' as const, renderProgress: 0 };
       }
-      return m;
+      return s;
     });
-    freedBytes += cleanupProjectPreviewSlices(proj.id);
-    return {
-      ...proj,
-      sourceDeleted: proj.sourceMode === 'local' ? true : proj.sourceDeleted,
-      sourceSizeBytes: 0,
-      moments: nextMoments,
-    };
+    return { ...p, segments: nextSegs };
   });
-  writeJson(PROJECTS_FILE, updatedProjects);
-  return { projects: updatedProjects, freedBytes };
+  if (projUpdated) {
+    writeJsonAtomic(PROJECTS_FILE, nextProjects);
+  }
+
+  return true;
 }
 
 function walkDirBytes(dir: string): number {
@@ -353,126 +498,21 @@ function walkDirBytes(dir: string): number {
 export function getStorageStatus(): StorageStatus {
   ensureWorkspace();
   const projects = listProjects();
+  const clips = listClips();
   let activeSegmentCount = 0;
   for (const p of projects) {
-    if (p.sourceMode === 'local' && !p.sourceDeleted && (p.sourceSizeBytes || 0) > 0) {
-      activeSegmentCount++;
-    }
-    for (const m of p.moments) {
-      if (m.segmentStatus === 'ready' && (m.segmentSizeBytes || 0) > 0) {
+    for (const s of p.segments) {
+      if (s.downloadStatus === 'ready' && (s.sourceSizeBytes || 0) > 0) {
         activeSegmentCount++;
       }
     }
   }
   return {
-    sourcesDir: SOURCES_DIR,
-    rendersDir: RENDERS_DIR,
+    sourcesDir: 'workspace/sources',
+    rendersDir: 'workspace/renders',
     totalSourceBytes: walkDirBytes(SOURCES_DIR),
     totalRenderBytes: walkDirBytes(RENDERS_DIR),
     activeSegmentCount,
+    totalClipCount: clips.length,
   };
-}
-
-export function deleteProject(projectId: string): boolean {
-  const all = listProjects();
-  const target = all.find((p) => p.id === projectId);
-  if (!target) return false;
-  const remaining = all.filter((p) => p.id !== projectId);
-  writeJson(PROJECTS_FILE, remaining);
-  if (target.fileName && target.sourceMode === 'local') {
-    try {
-      const srcPath = resolveSafeSourcePath(target.fileName);
-      if (fs.existsSync(srcPath)) {
-        fs.unlinkSync(srcPath);
-        removeEmptySourceSubdir(srcPath);
-      }
-    } catch {
-      // ignore
-    }
-  }
-  for (const m of target.moments) {
-    if (m.segmentFileName) {
-      try {
-        const segPath = resolveSafeSourcePath(m.segmentFileName);
-        if (fs.existsSync(segPath)) {
-          fs.unlinkSync(segPath);
-          removeEmptySourceSubdir(segPath);
-        }
-      } catch {
-        // ignore
-      }
-    }
-  }
-  try {
-    if (fs.existsSync(FRAMES_DIR)) {
-      for (const file of fs.readdirSync(FRAMES_DIR)) {
-        if (file.startsWith(`${projectId}_`) || file.startsWith(`preview_${projectId}_`)) {
-          fs.unlinkSync(path.join(FRAMES_DIR, file));
-        }
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return true;
-}
-
-export function listClips(): RenderedClip[] {
-  return readJson<RenderedClip[]>(CLIPS_FILE, []);
-}
-
-export function getClip(clipId: string): RenderedClip | undefined {
-  return listClips().find((c) => c.id === clipId);
-}
-
-export function saveClip(clip: RenderedClip): RenderedClip {
-  const all = listClips();
-  const idx = all.findIndex((c) => c.id === clip.id);
-  if (idx >= 0) {
-    all[idx] = clip;
-  } else {
-    all.unshift(clip);
-  }
-  writeJson(CLIPS_FILE, all);
-  return clip;
-}
-
-export function deleteClip(clipId: string): boolean {
-  const all = listClips();
-  const target = all.find((c) => c.id === clipId);
-  if (!target) return false;
-  writeJson(
-    CLIPS_FILE,
-    all.filter((c) => c.id !== clipId)
-  );
-  try {
-    const outPath = resolveSafeChildPath(RENDERS_DIR, target.outputFileName);
-    if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
-  } catch {
-    // ignore
-  }
-  return true;
-}
-
-export function loadAppSettings(): AppSettings {
-  const raw = readJson<Partial<AppSettings>>(SETTINGS_FILE, DEFAULT_SETTINGS);
-  return {
-    autoPruneSourceVod:
-      typeof raw.autoPruneSourceVod === 'boolean'
-        ? raw.autoPruneSourceVod
-        : DEFAULT_SETTINGS.autoPruneSourceVod,
-  };
-}
-
-export function saveAppSettings(patch: Partial<AppSettings>): AppSettings {
-  const current = loadAppSettings();
-  const next: AppSettings = {
-    ...current,
-    autoPruneSourceVod:
-      typeof patch.autoPruneSourceVod === 'boolean'
-        ? patch.autoPruneSourceVod
-        : current.autoPruneSourceVod,
-  };
-  writeJson(SETTINGS_FILE, next);
-  return next;
 }

@@ -174,7 +174,7 @@ export function parseMultilineTimestamps(
         });
         return;
       }
-      if (endSeconds > sourceDurationSec + 1) {
+      if (endSeconds > sourceDurationSec) {
         lineErrors.push({
           line: lineNum,
           text: trimmed,
