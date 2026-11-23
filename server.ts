@@ -56,6 +56,7 @@ import {
   clearCookiesFile,
   ensureYtDlp,
   getCookiesStatus,
+  resetCookieDetectionCache,
   saveCookiesContent,
 } from './server/ytdlp.ts';
 
@@ -181,6 +182,11 @@ async function startServer() {
 
   app.delete('/api/ytdlp/cookies', (_req, res) => {
     clearCookiesFile();
+    res.json(getCookiesStatus());
+  });
+
+  app.post('/api/ytdlp/cookies/rescan', (_req, res) => {
+    resetCookieDetectionCache();
     res.json(getCookiesStatus());
   });
 

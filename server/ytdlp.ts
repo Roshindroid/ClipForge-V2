@@ -120,65 +120,262 @@ export async function ensureYtDlp(): Promise<string> {
   return installPromise;
 }
 
+function getBrowserProfileCandidates(): Array<{ browser: string; paths: string[] }> {
+  const home = process.env.HOME || process.env.USERPROFILE || '/root';
+  const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+  const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+
+  if (process.platform === 'win32') {
+    return [
+      { browser: 'chrome', paths: [path.join(localAppData, 'Google', 'Chrome', 'User Data')] },
+      { browser: 'edge', paths: [path.join(localAppData, 'Microsoft', 'Edge', 'User Data')] },
+      { browser: 'brave', paths: [path.join(localAppData, 'BraveSoftware', 'Brave-Browser', 'User Data')] },
+      { browser: 'firefox', paths: [path.join(appData, 'Mozilla', 'Firefox', 'Profiles')] },
+      { browser: 'chromium', paths: [path.join(localAppData, 'Chromium', 'User Data')] },
+      { browser: 'vivaldi', paths: [path.join(localAppData, 'Vivaldi', 'User Data')] },
+      { browser: 'opera', paths: [path.join(appData, 'Opera Software', 'Opera Stable')] },
+    ];
+  }
+
+  if (process.platform === 'darwin') {
+    return [
+      { browser: 'chrome', paths: [path.join(home, 'Library/Application Support/Google/Chrome')] },
+      { browser: 'brave', paths: [path.join(home, 'Library/Application Support/BraveSoftware/Brave-Browser')] },
+      { browser: 'edge', paths: [path.join(home, 'Library/Application Support/Microsoft Edge')] },
+      { browser: 'firefox', paths: [path.join(home, 'Library/Application Support/Firefox')] },
+      { browser: 'chromium', paths: [path.join(home, 'Library/Application Support/Chromium')] },
+      { browser: 'vivaldi', paths: [path.join(home, 'Library/Application Support/Vivaldi')] },
+      { browser: 'opera', paths: [path.join(home, 'Library/Application Support/com.operasoftware.Opera')] },
+    ];
+  }
+
+  return [
+    { browser: 'chrome', paths: [path.join(home, '.config/google-chrome')] },
+    { browser: 'chromium', paths: [path.join(home, '.config/chromium')] },
+    { browser: 'brave', paths: [path.join(home, '.config/BraveSoftware/Brave-Browser')] },
+    { browser: 'edge', paths: [path.join(home, '.config/microsoft-edge')] },
+    { browser: 'firefox', paths: [path.join(home, '.mozilla/firefox')] },
+    { browser: 'vivaldi', paths: [path.join(home, '.config/vivaldi')] },
+    { browser: 'opera', paths: [path.join(home, '.config/opera')] },
+  ];
+}
+
+export function detectAvailableBrowserProfiles(): string[] {
+  const found: string[] = [];
+  for (const entry of getBrowserProfileCandidates()) {
+    if (entry.paths.some((p) => fs.existsSync(p))) {
+      found.push(entry.browser);
+    }
+  }
+  return found;
+}
+
 function hasLocalBrowserProfile(browserSpec: string): boolean {
-  const home = process.env.HOME || '/root';
   const browser = browserSpec.split(':')[0].trim().toLowerCase();
-  const candidates: Record<string, string[]> = {
-    chrome: [`${home}/.config/google-chrome`, `${home}/Library/Application Support/Google/Chrome`],
-    chromium: [`${home}/.config/chromium`],
-    brave: [`${home}/.config/BraveSoftware/Brave-Browser`],
-    edge: [`${home}/.config/microsoft-edge`],
-    firefox: [`${home}/.mozilla/firefox`, `${home}/Library/Application Support/Firefox`],
+  const entry = getBrowserProfileCandidates().find((c) => c.browser === browser);
+  return Boolean(entry && entry.paths.some((p) => fs.existsSync(p)));
+}
+
+function inspectNetscapeCookieFile(filePath: string): {
+  cookieCount: number;
+  hasYouTubeCookies: boolean;
+  mtimeIso: string;
+} | null {
+  try {
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return null;
+    const stat = fs.statSync(filePath);
+    if (stat.size === 0 || stat.size > 5 * 1024 * 1024) return null;
+    const lines = fs
+      .readFileSync(filePath, 'utf8')
+      .split(/\r?\n/)
+      .filter((l) => {
+        const t = l.trim();
+        return t && !t.startsWith('#') && t.split('\t').length >= 7;
+      });
+    if (lines.length === 0) return null;
+    const hasYouTubeCookies = lines.some((l) => {
+      const domain = l.split('\t')[0]?.toLowerCase() || '';
+      return domain.includes('youtube.com') || domain.includes('google.com');
+    });
+    return {
+      cookieCount: lines.length,
+      hasYouTubeCookies,
+      mtimeIso: stat.mtime.toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function findAutoDetectedCookieFile(): {
+  filePath: string;
+  fileName: string;
+  cookieCount: number;
+  hasYouTubeCookies: boolean;
+  mtimeIso: string;
+} | null {
+  const home = process.env.HOME || process.env.USERPROFILE || '/root';
+  const searchDirs = [
+    process.cwd(),
+    WORKSPACE_ROOT,
+    path.join(home, 'Downloads'),
+    path.join(home, 'Desktop'),
+    home,
+  ];
+
+  const candidates: Array<{
+    filePath: string;
+    fileName: string;
+    cookieCount: number;
+    hasYouTubeCookies: boolean;
+    mtimeIso: string;
+    priority: number;
+  }> = [];
+
+  const seenPaths = new Set<string>();
+
+  searchDirs.forEach((dir, dirIdx) => {
+    try {
+      if (!fs.existsSync(dir)) return;
+      for (const entry of fs.readdirSync(dir)) {
+        const lower = entry.toLowerCase();
+        const isCookieName =
+          lower === 'cookies.txt' ||
+          lower === '.youtube_cookies.txt' ||
+          lower === 'youtube_cookies.txt' ||
+          (lower.endsWith('.txt') && lower.includes('cookie'));
+        if (!isCookieName) continue;
+
+        const fullPath = path.resolve(dir, entry);
+        if (fullPath === path.resolve(WORKSPACE_COOKIES_PATH) || seenPaths.has(fullPath)) {
+          continue;
+        }
+        seenPaths.add(fullPath);
+
+        const parsed = inspectNetscapeCookieFile(fullPath);
+        if (!parsed) continue;
+
+        const ytNameBonus = lower.includes('youtube') ? 10 : 0;
+        const ytCookieBonus = parsed.hasYouTubeCookies ? 20 : 0;
+        const dirBonus = Math.max(0, 5 - dirIdx);
+        candidates.push({
+          filePath: fullPath,
+          fileName: entry,
+          cookieCount: parsed.cookieCount,
+          hasYouTubeCookies: parsed.hasYouTubeCookies,
+          mtimeIso: parsed.mtimeIso,
+          priority: ytCookieBonus + ytNameBonus + dirBonus,
+        });
+      }
+    } catch {
+      // ignore unreadable directories
+    }
+  });
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => {
+    if (b.priority !== a.priority) return b.priority - a.priority;
+    return b.mtimeIso.localeCompare(a.mtimeIso);
+  });
+
+  const best = candidates[0];
+  return {
+    filePath: best.filePath,
+    fileName: best.fileName,
+    cookieCount: best.cookieCount,
+    hasYouTubeCookies: best.hasYouTubeCookies,
+    mtimeIso: best.mtimeIso,
   };
-  const paths = candidates[browser] || [];
-  return paths.some((p) => fs.existsSync(p));
+}
+
+let cachedCookieStrategyKey: string | null = null;
+let cachedCookieArgs: string[] | null = null;
+
+export function resetCookieDetectionCache(): void {
+  cachedCookieStrategyKey = null;
+  cachedCookieArgs = null;
 }
 
 export function getCookiesStatus(): {
   configured: boolean;
-  source: 'env' | 'workspace' | 'browser' | 'none';
+  source: 'env' | 'workspace' | 'auto-file' | 'browser' | 'auto-browser' | 'none';
   cookieCount: number;
+  detail: string;
+  detectedBrowsers: string[];
   updatedAt?: string;
 } {
+  const detectedBrowsers = detectAvailableBrowserProfiles();
+
   const envFile = process.env.YTDLP_COOKIES_FILE?.trim();
   if (envFile && fs.existsSync(envFile)) {
-    const lines = fs
-      .readFileSync(envFile, 'utf8')
-      .split(/\r?\n/)
-      .filter((l) => l.trim() && !l.startsWith('#'));
-    return { configured: lines.length > 0, source: 'env', cookieCount: lines.length };
+    const info = inspectNetscapeCookieFile(envFile);
+    return {
+      configured: Boolean(info && info.cookieCount > 0),
+      source: 'env',
+      cookieCount: info?.cookieCount || 0,
+      detail: `Using YTDLP_COOKIES_FILE (${path.basename(envFile)})`,
+      detectedBrowsers,
+      updatedAt: info?.mtimeIso,
+    };
   }
 
   if (fs.existsSync(WORKSPACE_COOKIES_PATH)) {
-    const stat = fs.statSync(WORKSPACE_COOKIES_PATH);
-    const lines = fs
-      .readFileSync(WORKSPACE_COOKIES_PATH, 'utf8')
-      .split(/\r?\n/)
-      .filter((l) => l.trim() && !l.startsWith('#'));
-    if (lines.length > 0) {
+    const info = inspectNetscapeCookieFile(WORKSPACE_COOKIES_PATH);
+    if (info && info.cookieCount > 0) {
       return {
         configured: true,
         source: 'workspace',
-        cookieCount: lines.length,
-        updatedAt: stat.mtime.toISOString(),
+        cookieCount: info.cookieCount,
+        detail: `Saved workspace cookies (${info.cookieCount} entries)`,
+        detectedBrowsers,
+        updatedAt: info.mtimeIso,
       };
     }
   }
 
-  const browserSpec = process.env.YTDLP_COOKIES_FROM_BROWSER?.trim();
-  if (browserSpec && hasLocalBrowserProfile(browserSpec)) {
-    return { configured: true, source: 'browser', cookieCount: 1 };
+  const autoFile = findAutoDetectedCookieFile();
+  if (autoFile) {
+    return {
+      configured: true,
+      source: 'auto-file',
+      cookieCount: autoFile.cookieCount,
+      detail: `Auto-detected ${autoFile.fileName} (${autoFile.cookieCount} entries)`,
+      detectedBrowsers,
+      updatedAt: autoFile.mtimeIso,
+    };
   }
 
-  return { configured: false, source: 'none', cookieCount: 0 };
+  const browserSpec = process.env.YTDLP_COOKIES_FROM_BROWSER?.trim();
+  if (browserSpec && hasLocalBrowserProfile(browserSpec)) {
+    return {
+      configured: true,
+      source: 'browser',
+      cookieCount: 1,
+      detail: `Using configured browser (${browserSpec})`,
+      detectedBrowsers,
+    };
+  }
+
+  if (detectedBrowsers.length > 0) {
+    return {
+      configured: true,
+      source: 'auto-browser',
+      cookieCount: detectedBrowsers.length,
+      detail: `Auto-detected browser profile(s): ${detectedBrowsers.join(', ')}`,
+      detectedBrowsers,
+    };
+  }
+
+  return {
+    configured: false,
+    source: 'none',
+    cookieCount: 0,
+    detail: 'No local browser profile or cookies.txt found automatically.',
+    detectedBrowsers: [],
+  };
 }
 
-export function saveCookiesContent(rawInput: string): {
-  configured: boolean;
-  source: 'workspace';
-  cookieCount: number;
-  updatedAt: string;
-} {
+export function saveCookiesContent(rawInput: string): ReturnType<typeof getCookiesStatus> {
   ensureWorkspace();
   const trimmed = rawInput.trim();
   if (!trimmed) throw new Error('Cookie content cannot be empty.');
@@ -190,11 +387,9 @@ export function saveCookiesContent(rawInput: string): {
   });
 
   let finalContent = '';
-  let count = 0;
 
   if (netscapeLines.length > 0) {
     finalContent = '# Netscape HTTP Cookie File\n' + netscapeLines.join('\n') + '\n';
-    count = netscapeLines.length;
   } else {
     const cleaned = trimmed.replace(/^cookie:\s*/i, '');
     const pairs = cleaned
@@ -214,41 +409,99 @@ export function saveCookiesContent(rawInput: string): {
       return `.youtube.com\tTRUE\t/\tTRUE\t${expiry}\t${name}\t${val}`;
     });
     finalContent = '# Netscape HTTP Cookie File\n' + rows.join('\n') + '\n';
-    count = rows.length;
   }
 
   fs.writeFileSync(WORKSPACE_COOKIES_PATH, finalContent, { encoding: 'utf8', mode: 0o600 });
-  return {
-    configured: true,
-    source: 'workspace',
-    cookieCount: count,
-    updatedAt: new Date().toISOString(),
-  };
+  resetCookieDetectionCache();
+  return getCookiesStatus();
 }
 
 export function clearCookiesFile(): void {
   if (fs.existsSync(WORKSPACE_COOKIES_PATH)) {
     fs.unlinkSync(WORKSPACE_COOKIES_PATH);
   }
+  resetCookieDetectionCache();
 }
 
-export function getYtDlpBaseArgs(): string[] {
-  const args: string[] = ['--no-playlist', '--no-warnings'];
+function getCookieArgStrategies(): Array<{ key: string; args: string[] }> {
+  const strategies: Array<{ key: string; args: string[] }> = [];
   const cookiesFile = process.env.YTDLP_COOKIES_FILE?.trim();
   const cookiesFromBrowser = process.env.YTDLP_COOKIES_FROM_BROWSER?.trim();
-  const jsRuntime = process.env.YTDLP_JS_RUNTIME?.trim() || `node:${process.execPath}`;
 
   if (cookiesFile && fs.existsSync(cookiesFile)) {
-    args.push('--cookies', cookiesFile);
-  } else if (fs.existsSync(WORKSPACE_COOKIES_PATH)) {
-    args.push('--cookies', WORKSPACE_COOKIES_PATH);
-  } else if (cookiesFromBrowser && hasLocalBrowserProfile(cookiesFromBrowser)) {
-    args.push('--cookies-from-browser', cookiesFromBrowser);
+    strategies.push({ key: `env:${cookiesFile}`, args: ['--cookies', cookiesFile] });
   }
+  if (fs.existsSync(WORKSPACE_COOKIES_PATH)) {
+    strategies.push({ key: 'workspace', args: ['--cookies', WORKSPACE_COOKIES_PATH] });
+  }
+  const autoFile = findAutoDetectedCookieFile();
+  if (autoFile) {
+    strategies.push({ key: `auto-file:${autoFile.filePath}`, args: ['--cookies', autoFile.filePath] });
+  }
+  if (cookiesFromBrowser && hasLocalBrowserProfile(cookiesFromBrowser)) {
+    strategies.push({
+      key: `env-browser:${cookiesFromBrowser}`,
+      args: ['--cookies-from-browser', cookiesFromBrowser],
+    });
+  }
+  for (const browser of detectAvailableBrowserProfiles()) {
+    if (cookiesFromBrowser?.toLowerCase().startsWith(browser)) continue;
+    strategies.push({ key: `auto-browser:${browser}`, args: ['--cookies-from-browser', browser] });
+  }
+  // Always keep a clean no-cookie attempt as final fallback (e.g. if browser DB is locked)
+  strategies.push({ key: 'none', args: [] });
+
+  if (cachedCookieStrategyKey && cachedCookieArgs) {
+    const idx = strategies.findIndex((s) => s.key === cachedCookieStrategyKey);
+    if (idx > 0) {
+      const [hit] = strategies.splice(idx, 1);
+      strategies.unshift(hit);
+    }
+  }
+
+  return strategies;
+}
+
+export function getYtDlpBaseArgs(cookieArgs?: string[]): string[] {
+  const args: string[] = ['--no-playlist', '--no-warnings'];
+  const resolvedCookieArgs =
+    cookieArgs !== undefined ? cookieArgs : getCookieArgStrategies()[0]?.args || [];
+  const jsRuntime = process.env.YTDLP_JS_RUNTIME?.trim() || `node:${process.execPath}`;
+
+  args.push(...resolvedCookieArgs);
   if (jsRuntime) {
     args.push('--js-runtimes', jsRuntime);
   }
   return args;
+}
+
+async function runWithCookieStrategies<T>(
+  runner: (baseArgs: string[]) => Promise<T>
+): Promise<T> {
+  const strategies = getCookieArgStrategies();
+  let lastError: unknown;
+
+  for (const strat of strategies) {
+    try {
+      const result = await runner(getYtDlpBaseArgs(strat.args));
+      cachedCookieStrategyKey = strat.key;
+      cachedCookieArgs = strat.args;
+      return result;
+    } catch (err) {
+      lastError = err;
+      const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+      const isPrivateOrDeleted =
+        msg.includes('private video') ||
+        msg.includes('video unavailable') ||
+        msg.includes('has been removed');
+      if (isPrivateOrDeleted) {
+        throw err;
+      }
+      // Otherwise try next detected cookie/browser/fallback strategy
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('yt-dlp command failed');
 }
 
 export function runProcessWithTimeout(
@@ -315,35 +568,36 @@ export async function fetchMetadataWithYtDlp(
   platform: string
 ): Promise<YtDlpMetadata> {
   const bin = await ensureYtDlp();
-  const baseArgs = getYtDlpBaseArgs();
 
   let stdout = '';
   try {
-    const res = await runProcessWithTimeout(
-      bin,
-      [
-        ...baseArgs,
-        '--dump-single-json',
-        '--skip-download',
-        '-f',
-        'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b',
-        url,
-      ],
-      60000
-    );
-    stdout = res.stdout;
+    stdout = await runWithCookieStrategies(async (baseArgs) => {
+      try {
+        const res = await runProcessWithTimeout(
+          bin,
+          [
+            ...baseArgs,
+            '--dump-single-json',
+            '--skip-download',
+            '-f',
+            'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b',
+            url,
+          ],
+          60000
+        );
+        return res.stdout;
+      } catch {
+        const res = await runProcessWithTimeout(
+          bin,
+          [...baseArgs, '--dump-single-json', '--skip-download', url],
+          60000
+        );
+        return res.stdout;
+      }
+    });
   } catch (err) {
-    try {
-      const res = await runProcessWithTimeout(
-        bin,
-        [...baseArgs, '--dump-single-json', '--skip-download', url],
-        60000
-      );
-      stdout = res.stdout;
-    } catch (fallbackErr) {
-      const msg = fallbackErr instanceof Error ? fallbackErr.message : String(err);
-      throw formatYtDlpError(msg, platform);
-    }
+    const msg = err instanceof Error ? err.message : String(err);
+    throw formatYtDlpError(msg, platform);
   }
 
   const info = JSON.parse(stdout) as {
@@ -490,32 +744,32 @@ export async function resolveStreamUrlsWithYtDlp(
   }
 
   const bin = await ensureYtDlp();
-  const baseArgs = getYtDlpBaseArgs();
 
-  let lines: string[] = [];
-  try {
-    const res = await runProcessWithTimeout(
-      bin,
-      [
-        ...baseArgs,
-        '-f',
-        'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b',
-        '-g',
-        url,
-      ],
-      45000
-    );
-    lines = res.stdout
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l.startsWith('http'));
-  } catch {
-    const res = await runProcessWithTimeout(bin, [...baseArgs, '-g', url], 45000);
-    lines = res.stdout
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l.startsWith('http'));
-  }
+  let lines: string[] = await runWithCookieStrategies(async (baseArgs) => {
+    try {
+      const res = await runProcessWithTimeout(
+        bin,
+        [
+          ...baseArgs,
+          '-f',
+          'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b',
+          '-g',
+          url,
+        ],
+        45000
+      );
+      return res.stdout
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.startsWith('http'));
+    } catch {
+      const res = await runProcessWithTimeout(bin, [...baseArgs, '-g', url], 45000);
+      return res.stdout
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.startsWith('http'));
+    }
+  });
 
   if (lines.length === 0) {
     throw new Error('Could not resolve playable stream URLs from link.');
@@ -553,7 +807,6 @@ export async function downloadSegmentWithYtDlp(
   onProgress?: (pct: number, detail: string) => void
 ): Promise<void> {
   const bin = await ensureYtDlp();
-  const baseArgs = getYtDlpBaseArgs();
   const parentDir = path.dirname(targetPath);
   if (!fs.existsSync(parentDir)) {
     fs.mkdirSync(parentDir, { recursive: true });
@@ -562,102 +815,106 @@ export async function downloadSegmentWithYtDlp(
   const s = Math.max(0, Math.floor(startSec));
   const e = Math.max(s + 2, Math.ceil(endSec));
 
-  const args = [
-    ...baseArgs,
-    '--newline',
-    '--progress',
-    '--download-sections',
-    `*${s}-${e}`,
-    '--force-keyframes-at-cuts',
-    '-S',
-    'res:1080,ext:mp4:m4a',
-    '-f',
-    'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b',
-    '--merge-output-format',
-    'mp4',
-    '-o',
-    targetPath,
-    url,
-  ];
+  try {
+    await runWithCookieStrategies(async (baseArgs) => {
+      const args = [
+        ...baseArgs,
+        '--newline',
+        '--progress',
+        '--download-sections',
+        `*${s}-${e}`,
+        '--force-keyframes-at-cuts',
+        '-S',
+        'res:1080,ext:mp4:m4a',
+        '-f',
+        'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b',
+        '--merge-output-format',
+        'mp4',
+        '-o',
+        targetPath,
+        url,
+      ];
 
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(bin, args, { shell: false });
-    let stderr = '';
-    let lineBuf = '';
-    let settled = false;
-    const STALL_TIMEOUT_MS = 120_000;
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(bin, args, { shell: false });
+        let stderr = '';
+        let lineBuf = '';
+        let settled = false;
+        const STALL_TIMEOUT_MS = 120_000;
 
-    let stallTimer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        child.kill('SIGTERM');
-        setTimeout(() => child.kill('SIGKILL'), 2000);
-        reject(new Error('1080p segment download stalled for 120s.'));
-      }
-    }, STALL_TIMEOUT_MS);
-
-    const resetStall = () => {
-      clearTimeout(stallTimer);
-      stallTimer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          child.kill('SIGTERM');
-          setTimeout(() => child.kill('SIGKILL'), 2000);
-          reject(new Error('1080p segment download stalled for 120s.'));
-        }
-      }, STALL_TIMEOUT_MS);
-    };
-
-    const handleChunk = (text: string) => {
-      resetStall();
-      lineBuf += text;
-      const lines = lineBuf.split(/[\r\n]+/);
-      lineBuf = lines.pop() || '';
-      for (const line of lines) {
-        const m = line.match(/\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+([^\s]+)(?:\s+at\s+([^\s]+))?/i);
-        if (m && onProgress) {
-          const pct = Math.min(100, Math.max(0, Number(m[1])));
-          onProgress(pct, `${pct.toFixed(0)}% of ${m[2]}`);
-        }
-      }
-    };
-
-    child.stdout.on('data', (chunk) => handleChunk(String(chunk)));
-    child.stderr.on('data', (chunk) => {
-      const sChunk = String(chunk);
-      if (stderr.length < 512 * 1024) stderr += sChunk;
-      handleChunk(sChunk);
-    });
-
-    child.on('error', (err) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(stallTimer);
-        reject(err);
-      }
-    });
-
-    child.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(stallTimer);
-      if (code === 0 && fs.existsSync(targetPath)) {
-        resolve();
-      } else {
-        if (fs.existsSync(targetPath)) {
-          try {
-            fs.unlinkSync(targetPath);
-          } catch {
-            // ignore
+        let stallTimer = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            child.kill('SIGTERM');
+            setTimeout(() => child.kill('SIGKILL'), 2000);
+            reject(new Error('1080p segment download stalled for 120s.'));
           }
-        }
-        reject(
-          formatYtDlpError(
-            stderr.trim() || `${path.basename(bin)} exited with code ${code}`,
-            platform
-          )
-        );
-      }
+        }, STALL_TIMEOUT_MS);
+
+        const resetStall = () => {
+          clearTimeout(stallTimer);
+          stallTimer = setTimeout(() => {
+            if (!settled) {
+              settled = true;
+              child.kill('SIGTERM');
+              setTimeout(() => child.kill('SIGKILL'), 2000);
+              reject(new Error('1080p segment download stalled for 120s.'));
+            }
+          }, STALL_TIMEOUT_MS);
+        };
+
+        const handleChunk = (text: string) => {
+          resetStall();
+          lineBuf += text;
+          const lines = lineBuf.split(/[\r\n]+/);
+          lineBuf = lines.pop() || '';
+          for (const line of lines) {
+            const m = line.match(
+              /\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+([^\s]+)(?:\s+at\s+([^\s]+))?/i
+            );
+            if (m && onProgress) {
+              const pct = Math.min(100, Math.max(0, Number(m[1])));
+              onProgress(pct, `${pct.toFixed(0)}% of ${m[2]}`);
+            }
+          }
+        };
+
+        child.stdout.on('data', (chunk) => handleChunk(String(chunk)));
+        child.stderr.on('data', (chunk) => {
+          const sChunk = String(chunk);
+          if (stderr.length < 512 * 1024) stderr += sChunk;
+          handleChunk(sChunk);
+        });
+
+        child.on('error', (err) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(stallTimer);
+            reject(err);
+          }
+        });
+
+        child.on('close', (code) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(stallTimer);
+          if (code === 0 && fs.existsSync(targetPath)) {
+            resolve();
+          } else {
+            if (fs.existsSync(targetPath)) {
+              try {
+                fs.unlinkSync(targetPath);
+              } catch {
+                // ignore
+              }
+            }
+            reject(new Error(stderr.trim() || `${path.basename(bin)} exited with code ${code}`));
+          }
+        });
+      });
     });
-  });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw formatYtDlpError(msg, platform);
+  }
 }

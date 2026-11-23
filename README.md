@@ -87,7 +87,7 @@ YTDLP_COOKIES_FROM_BROWSER=
 ```
 
 - **AI Keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`)**: Optional. Used exclusively on the backend in the **YouTube Upload** tab to draft titles, descriptions, hashtags, and searchable tags. The entire clipping and publishing workflow works without AI keys.
-- **YouTube Cookies**: You can either set `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_FROM_BROWSER` in `.env`, or paste a Netscape `cookies.txt` directly inside the UI via **YouTube Cookies**.
+- **YouTube Cookies (Automatic + Manual)**: ClipForge automatically detects installed desktop browser profiles (`chrome`, `edge`, `brave`, `firefox`, etc.) and local Netscape `cookies.txt` files in the project root, `workspace/`, `~/Downloads`, `~/Desktop`, or `~/` with automatic fallback. You can also set `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_FROM_BROWSER` in `.env`, or click **YouTube Cookies** in the UI to upload, paste, or re-scan.
 
 ### 4. Start the application
 

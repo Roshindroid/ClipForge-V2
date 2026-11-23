@@ -55,7 +55,12 @@ export function CreateClipsView({
   const [createError, setCreateError] = useState<string | null>(null);
 
   // Cookies Modal
-  const [cookiesConfigured, setCookiesConfigured] = useState(false);
+  const [cookiesStatus, setCookiesStatus] = useState<{
+    configured: boolean;
+    source: string;
+    detail?: string;
+    detectedBrowsers?: string[];
+  }>({ configured: false, source: 'none' });
   const [cookiesOpen, setCookiesOpen] = useState(false);
   const [cookiesInput, setCookiesInput] = useState('');
   const [cookiesSaving, setCookiesSaving] = useState(false);
@@ -70,7 +75,7 @@ export function CreateClipsView({
   useEffect(() => {
     fetch('/api/ytdlp/cookies/status')
       .then((r) => r.json())
-      .then((d) => setCookiesConfigured(Boolean(d.configured)))
+      .then((d) => setCookiesStatus(d || { configured: false, source: 'none' }))
       .catch(() => {});
   }, []);
 
@@ -192,7 +197,7 @@ export function CreateClipsView({
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Invalid cookie file');
-      setCookiesConfigured(Boolean(data.configured));
+      setCookiesStatus(data);
       setCookiesMsg('Cookies saved.');
       setTimeout(() => setCookiesOpen(false), 900);
     } catch (err) {
@@ -203,10 +208,21 @@ export function CreateClipsView({
   };
 
   const handleClearCookies = async () => {
-    await fetch('/api/ytdlp/cookies', { method: 'DELETE' });
-    setCookiesConfigured(false);
+    const res = await fetch('/api/ytdlp/cookies', { method: 'DELETE' });
+    const data = await res.json().catch(() => ({ configured: false, source: 'none' }));
+    setCookiesStatus(data);
     setCookiesInput('');
-    setCookiesMsg('Cookies removed.');
+    setCookiesMsg('Saved workspace cookies removed.');
+  };
+
+  const handleRescanCookies = async () => {
+    setCookiesMsg(null);
+    const res = await fetch('/api/ytdlp/cookies/rescan', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      setCookiesStatus(data);
+      setCookiesMsg(data.detail || 'Cookie scan complete.');
+    }
   };
 
   const confirmDeleteProject = async () => {
@@ -272,10 +288,17 @@ export function CreateClipsView({
           <button
             type="button"
             onClick={() => setCookiesOpen(true)}
+            title={cookiesStatus.detail || 'Manage YouTube Cookies'}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#0E1016] hover:bg-[#1B202C] border border-[#232834] rounded-lg text-[#CBD5E1] cursor-pointer"
           >
-            <Cookie className="w-3.5 h-3.5 text-amber-400" />
-            {cookiesConfigured ? 'Cookies Active' : 'YouTube Cookies'}
+            <Cookie className={`w-3.5 h-3.5 ${cookiesStatus.configured ? 'text-emerald-400' : 'text-amber-400'}`} />
+            {cookiesStatus.source === 'auto-browser'
+              ? 'Cookies: Auto (Browser)'
+              : cookiesStatus.source === 'auto-file'
+                ? 'Cookies: Auto (File)'
+                : cookiesStatus.configured
+                  ? 'Cookies Active'
+                  : 'YouTube Cookies'}
           </button>
 
           {activeProject && (
@@ -630,14 +653,54 @@ export function CreateClipsView({
       {cookiesOpen && (
         <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
           <div className="bg-[#13161D] border border-[#2E3545] rounded-xl max-w-lg w-full p-6 space-y-4">
-            <h3 className="font-display text-base font-semibold text-[#F4F5F7]">
-              YouTube Cookies (Netscape Format)
-            </h3>
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="font-display text-base font-semibold text-[#F4F5F7]">
+                YouTube Cookies (Auto-Detected + Manual)
+              </h3>
+              <button
+                type="button"
+                onClick={handleRescanCookies}
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-md text-[#CBD5E1] cursor-pointer"
+              >
+                <RefreshCw className="w-3 h-3" />
+                Re-scan System
+              </button>
+            </div>
+
+            <div className="px-3 py-2.5 rounded-lg border border-[#232834] bg-[#0E1016] text-xs space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-[#CBD5E1]">Current Status</span>
+                <span className={cookiesStatus.configured ? 'text-emerald-400 font-mono' : 'text-amber-300 font-mono'}>
+                  {cookiesStatus.source}
+                </span>
+              </div>
+              <p className="text-[#94A3B8]">
+                {cookiesStatus.detail || 'ClipForge automatically scans local browser profiles (Chrome, Edge, Brave, Firefox) and exported cookies.txt files in your Downloads or project folder.'}
+              </p>
+            </div>
+
             <p className="text-xs text-[#94A3B8] leading-relaxed">
-              Paste exported <span className="font-mono text-[#CBD5E1]">cookies.txt</span> contents if a YouTube video requires sign-in or bot verification. Stored locally in your workspace only.
+              Optionally upload or paste a Netscape <span className="font-mono text-[#CBD5E1]">cookies.txt</span> file to override auto-detection (stored locally in <span className="font-mono">workspace/</span> only).
             </p>
+
+            <label className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-lg text-[#F4F5F7] cursor-pointer">
+              <span>Choose cookies.txt File</span>
+              <input
+                type="file"
+                accept=".txt,text/plain"
+                className="hidden"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const text = await file.text();
+                  setCookiesInput(text);
+                  e.target.value = '';
+                }}
+              />
+            </label>
+
             <textarea
-              rows={6}
+              rows={5}
               value={cookiesInput}
               onChange={(e) => setCookiesInput(e.target.value)}
               placeholder="# Netscape HTTP Cookie File"
@@ -645,13 +708,13 @@ export function CreateClipsView({
             />
             {cookiesMsg && <p className="text-xs text-emerald-300">{cookiesMsg}</p>}
             <div className="flex items-center justify-between gap-3">
-              {cookiesConfigured ? (
+              {cookiesStatus.source === 'workspace' ? (
                 <button
                   type="button"
                   onClick={handleClearCookies}
                   className="px-3 py-1.5 text-xs text-rose-300 hover:text-rose-200 border border-rose-800/60 rounded-lg cursor-pointer"
                 >
-                  Clear Saved Cookies
+                  Clear Uploaded Cookies
                 </button>
               ) : (
                 <span />
