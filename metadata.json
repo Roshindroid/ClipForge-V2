@@ -1,0 +1,6 @@
+{
+  "name": "ClipForge",
+  "description": "Streamlined batch video clipping engine that extracts custom timestamp ranges, independently detects facecams with computer vision, automatically resolves vertical layouts with Gameplay-Only fallback, and renders 9:16 Shorts with batch ZIP download.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
