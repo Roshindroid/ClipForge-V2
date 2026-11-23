@@ -16,6 +16,8 @@ ClipForge is a local-first video clipping and vertical Shorts publishing studio.
 4. **Permanent Local Storage (`2. My Clips`)**: Completed MP4s and project state are saved under `workspace/` (`projects.json`, `clips.json`, `sources/`, `renders/`) and automatically restored on server restart until you explicitly delete a clip or project.
 5. **YouTube Upload (`3. YouTube Upload`)**: Sign in with Google OAuth (tokens kept in browser memory only), optionally generate titles, 3 alternative titles, hook taglines, descriptions, hashtags, and searchable tags via backend Anthropic or OpenAI keys, edit freely, and upload or schedule Shorts via YouTube Data API v3.
 
+> **First-time YouTube sign-in**: The Firebase project backing Google OAuth must authorize the host you open the app from. For local dev this means `localhost` must be listed under **Firebase Console → Authentication → Settings → Authorized domains** (project `project-457b651b-8bca-442e-b2f`). If you see *"This domain (localhost) is not authorized in Firebase Authentication"*, add `localhost` there and retry — no app restart needed. For production, authorize your real domain instead and leave `localhost` out of public deployments.
+
 ---
 
 ## Prerequisites
@@ -86,7 +88,7 @@ YTDLP_COOKIES_FILE=
 YTDLP_COOKIES_FROM_BROWSER=
 ```
 
-- **AI Keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`)**: Optional. Used exclusively on the backend in the **YouTube Upload** tab to draft titles, descriptions, hashtags, and searchable tags. The entire clipping and publishing workflow works without AI keys.
+- **AI Keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`)**: Optional. Used exclusively on the backend in the **YouTube Upload** tab to draft titles, descriptions, hashtags, and searchable tags. At least one of the two must be set for the AI metadata assistant to respond; the entire clipping and publishing workflow works without either. Note: the `.env.example` also lists `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `OLLAMA_*` entries, but the backend currently only reads `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` — the others are reserved for future use.
 - **YouTube Cookies (Automatic + Manual)**: ClipForge automatically detects installed desktop browser profiles (`chrome`, `edge`, `brave`, `firefox`, etc.) and local Netscape `cookies.txt` files in the project root, `workspace/`, `~/Downloads`, `~/Desktop`, or `~/` with automatic fallback. You can also set `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_FROM_BROWSER` in `.env`, or click **YouTube Cookies** in the UI to upload, paste, or re-scan.
 
 ### 4. Start the application
@@ -164,3 +166,31 @@ ClipForge-V2/
 - **Manual-First Design**: Automatic facecam detection and automatic clip discovery are disabled. Facecam-based layouts require you to draw and save a facecam region, or choose **Center Crop** for full-frame footage.
 - **Persistent Workspace**: Projects, downloaded segments, and finished MP4 clips live in `workspace/` and remain available after restarting the server or computer until explicitly deleted.
 - **Credential Safety**: `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are read only on the backend and never sent to the browser. YouTube OAuth access tokens stay in browser memory only.
+
+---
+
+## Troubleshooting
+
+### "EPERM: operation not permitted, rename ... projects.json" (Windows)
+
+Symptom: the server crashes mid-render with a `rename` EPERM on `workspace/projects.json`.
+
+Cause: the project lives in a OneDrive-synced folder (or is scanned by antivirus). OneDrive/AV briefly lock files, which makes Node's atomic `rename()` fail during the per-progress `saveProject` write.
+
+Fix applied in `server/storage.ts`: `writeJsonAtomic` now retries the rename with backoff on transient lock errors (EPERM/EACCES/EBUSY, up to 8 attempts) and falls back to an in-place overwrite if the lock persists. If crashes still occur, move the project out of OneDrive (e.g. `C:\dev\ClipForge-V2`) or pause OneDrive sync while rendering.
+
+### "This domain (localhost) is not authorized in Firebase Authentication"
+
+Cause: the Firebase project's Authorized Domains list doesn't include the host you're browsing from.
+
+Fix: Firebase Console → Authentication → Settings → Authorized domains → Add `localhost` (or your production domain). No restart required. See step 5 above for the project ID.
+
+### AI metadata assistant returns "No AI provider keys configured"
+
+Cause: neither `OPENAI_API_KEY` nor `ANTHROPIC_API_KEY` is set in `.env`.
+
+Fix: set at least one of them in `.env` and restart the server. The clipping and manual metadata workflows still work without any key.
+
+### Port 3000 already in use (`EADDRINUSE`)
+
+Another process (a previous dev server, or the Vite HMR websocket on 24678) is still bound. Stop it (close the old terminal, or `Stop-Process` the orphaned `node` / `tsx` process) and rerun `npm run dev`.

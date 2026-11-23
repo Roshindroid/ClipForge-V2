@@ -38,6 +38,7 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 *.tmp
+*.tmp.*
 *.swp
 *.swo
 
@@ -46,3 +47,8 @@ pnpm-debug.log*
 Thumbs.db
 .vscode/
 .idea/
+
+# Kilo tool state (custom agents are keepable; runtime state is local)
+.kilo/*
+!.kilo/agents/
+!.kilo/agents/**
